@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>fast_mcp_client Chat UI</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div class="title">
+          <h1>Agent Chat</h1>
+          <p class="subtitle">串流顯示 answer；done 後顯示 tool_call JSON</p>
+        </div>
+        <div class="controls">
+          <label>
+            Gateway
+            <input id="baseUrl" type="text" value="http://localhost:8081" />
+          </label>
+          <label>
+            Session
+            <input id="sessionId" type="text" value="u1" />
+          </label>
+          <label>
+            LLM Provider
+            <input id="llmProvider" type="text" value="ollama" placeholder="ollama / openai (optional)" />
+          </label>
+          <label>
+            LLM Model
+            <input id="llmModel" type="text" value="yasserrmd/Qwen2.5-7B-Instruct-1M" placeholder="optional" />
+          </label>
+          <label class="checkbox">
+            <input id="toolResultFull" type="checkbox" checked />
+            tool_call 用 full
+          </label>
+        </div>
+      </header>
+
+      <main class="main">
+        <section class="chat">
+          <div id="messages" class="messages"></div>
+        </section>
+        <section class="events">
+          <div class="events-header">
+            <h2>事件紀錄</h2>
+            <div class="events-actions">
+              <button id="toggleLogOrder" class="btn btn-secondary" type="button">最新在上</button>
+              <button id="clearLog" class="btn btn-secondary" type="button">清空</button>
+            </div>
+          </div>
+          <pre id="eventLog" class="eventLog"></pre>
+        </section>
+      </main>
+
+      <footer class="composer">
+        <form id="chatForm" class="composer-form">
+          <input
+            id="messageInput"
+            type="text"
+            placeholder="輸入：手術單號 / 病例代號 / 手術開始時間區間…"
+            autocomplete="off"
+          />
+          <button id="sendBtn" class="btn" type="submit">送出</button>
+          <button id="stopBtn" class="btn btn-secondary" type="button" disabled>停止</button>
+        </form>
+        <div class="hint">
+          API：POST <code>/agent/chat</code>（SSE over fetch）
+        </div>
+      </footer>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

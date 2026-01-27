@@ -1,0 +1,41 @@
+# fast_mcp_client 統一設定檔（非敏感）
+#
+# 注意：
+# - OPENAI_API_KEY 這類 secret 仍建議用環境變數（或 Windows 全域 env），不要寫進 YAML。
+# - 你也可以用 `FAST_MCP_CONFIG` 指定其他 yaml 路徑。
+
+gateway:
+  host: "0.0.0.0"
+  port: 8081
+  reload: false
+
+mcp:
+  # MCP client 要連的 servers（取代 mcp.local.json / mcp.json）
+  servers:
+    report-api-local:
+      type: "streamable-http"
+      url: "http://localhost:3008/mcp"
+      disabled: false
+
+llm:
+  # 預設優先使用開源模型（Ollama）
+  primary_provider: "ollama" # ollama | openai
+  primary_model: "yasserrmd/Qwen2.5-7B-Instruct-1M" # milkey/GLM-4-9B-0414:Q4_K_M | yasserrmd/Qwen2.5-7B-Instruct-1M | linbeiJiang/Llama-3.1-8B-Instruct
+  ollama_host: "http://localhost:11434"
+  # 讓模型在「最後一次請求」後維持載入多久（例如: "5m", "30m", 300）
+  ollama_keep_alive: "5m"
+  # 社群曾反映 keep_alive 在某些情境仍會被卸載；可選擇開啟「定時 warm-up」
+  # 會定期送一個極小的 generate 請求，讓模型保持熱身狀態。
+  ollama_warmup:
+    enabled: false
+    interval_seconds: 240
+    prompt: "ping"
+    num_predict: 1
+
+openai:
+  # OpenAI 當最後防線時使用的 model（需有 OPENAI_API_KEY）
+  fallback_model: "gpt-4.1-mini"
+
+logging:
+  verbose: true
+

@@ -1,0 +1,6 @@
+fastmcp
+openai
+fastapi
+uvicorn[standard]
+ollama
+pyyaml

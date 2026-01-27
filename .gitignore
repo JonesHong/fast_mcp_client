@@ -1,0 +1,26 @@
+# Local config (copy `config.example.yaml` -> `config.yaml`)
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv / tooling
+.venv/
+venv/
+env/
+.python-version
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
