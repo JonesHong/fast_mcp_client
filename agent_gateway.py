@@ -422,6 +422,52 @@ def _sse(event: str, data: Any) -> bytes:
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+def _parse_duration_seconds(value: Any) -> Optional[float]:
+    """
+    Parse durations like:
+    - 300 (seconds)
+    - "300" (seconds)
+    - "5s", "5m", "1h", "2d", "500ms"
+    Returns seconds (float) or None if unknown.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip().lower()
+    if not s:
+        return None
+
+    # pure number => seconds
+    try:
+        return float(s)
+    except Exception:
+        pass
+
+    import re
+
+    m = re.fullmatch(r"(\\d+(?:\\.\\d+)?)(ms|s|m|h|d)", s)
+    if not m:
+        return None
+
+    num = float(m.group(1))
+    unit = m.group(2)
+    if unit == "ms":
+        return num / 1000.0
+    if unit == "s":
+        return num
+    if unit == "m":
+        return num * 60.0
+    if unit == "h":
+        return num * 3600.0
+    if unit == "d":
+        return num * 86400.0
+    return None
+
 async def _ollama_warmup_loop(
     *,
     host: str,
@@ -435,11 +481,19 @@ async def _ollama_warmup_loop(
 ) -> None:
     client = ollama.AsyncClient(host=host)
 
+    if verbose:
+        print(
+            "[OllamaWarmup] start "
+            f"model={model} keep_alive={keep_alive} intervalSeconds={float(interval_seconds):.3f} "
+            f"time={_iso_now()}"
+        )
+
     while True:
         if stop.is_set():
             return
 
         try:
+            started = time.perf_counter()
             await client.generate(
                 model=model,
                 prompt=prompt,
@@ -451,7 +505,13 @@ async def _ollama_warmup_loop(
                 stream=False,
             )
             if verbose:
-                print(f"[OllamaWarmup] ok model={model} keep_alive={keep_alive} time={_iso_now()}")
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                next_in = float(interval_seconds)
+                print(
+                    "[OllamaWarmup] ok "
+                    f"elapsedMs={elapsed_ms:.3f} nextInSec={next_in:.1f} "
+                    f"model={model} keep_alive={keep_alive} time={_iso_now()}"
+                )
         except Exception as exc:
             # Do not crash the gateway for warmup failures (ollama not running, model missing, etc.)
             if verbose:
@@ -536,12 +596,29 @@ async def lifespan(app: FastAPI):
         host = str(get_cfg_value(cfg, "llm.ollama_host", "http://localhost:11434"))
         model = str(get_cfg_value(cfg, "llm.primary_model", "") or "")
         keep_alive = get_cfg_value(cfg, "llm.ollama_keep_alive")
-        interval_seconds = float(warmup_cfg.get("interval_seconds", 240))
+
+        lead_seconds = float(warmup_cfg.get("lead_seconds", 5))
+        strategy = str(warmup_cfg.get("strategy", "keep_alive_minus_lead")).strip().lower()
+        interval_raw = warmup_cfg.get("interval_seconds", None)
+        if interval_raw is not None:
+            interval_seconds = float(interval_raw)
+        else:
+            keep_alive_seconds = _parse_duration_seconds(keep_alive)
+            if strategy in {"keep_alive_minus_lead", "keep_alive"} and keep_alive_seconds:
+                interval_seconds = max(1.0, float(keep_alive_seconds) - float(lead_seconds))
+            else:
+                interval_seconds = 240.0
         prompt = str(warmup_cfg.get("prompt", "ping"))
         num_predict = int(warmup_cfg.get("num_predict", 1))
         verbose = bool(get_cfg_value(cfg, "logging.verbose", False))
 
         if model:
+            if verbose and interval_raw is None:
+                print(
+                    "[OllamaWarmup] computed interval "
+                    f"strategy={strategy} keep_alive={keep_alive} leadSeconds={lead_seconds} "
+                    f"intervalSeconds={interval_seconds:.3f} time={_iso_now()}"
+                )
             warmup_task = asyncio.create_task(
                 _ollama_warmup_loop(
                     host=host,

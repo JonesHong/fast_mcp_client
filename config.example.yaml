@@ -28,7 +28,10 @@ llm:
   # 會定期送一個極小的 generate 請求，讓模型保持熱身狀態。
   ollama_warmup:
     enabled: false
-    interval_seconds: 240
+    # 若未設定 interval_seconds，會自動使用：ollama_keep_alive - lead_seconds
+    strategy: "keep_alive_minus_lead"
+    lead_seconds: 5
+    # interval_seconds: 240
     prompt: "ping"
     num_predict: 1
 
@@ -38,4 +41,3 @@ openai:
 
 logging:
   verbose: true
-
