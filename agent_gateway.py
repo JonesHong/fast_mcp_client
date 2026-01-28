@@ -685,28 +685,98 @@ async def list_tools(request: Request) -> ToolsListResponse:
         "- `event: delta` → `data: {id, text}`\n"
         "- `event: done` → `data: {id, time, answer}`\n"
         "- `event: error` → `data: {id, message}`\n\n"
+        "若 `stream=false`，則回傳 `application/json`。\n"
+        "- medical：回 `AgentResponseWithNaturalLanguage`（含 toolCall + answer）\n"
+        "- intro/other：回 `{time, answer}`\n\n"
         "前端建議：先串流顯示 `delta` 拼成 answer，收到 `done` 後再把 `tool_call` JSON 顯示在下方。"
     ),
     responses={
         200: {
-            "description": "SSE events（text/event-stream）",
+            "description": "stream=true: text/event-stream（SSE）；stream=false: application/json",
             "content": {
+                "application/json": {
+                    "schema": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/AgentResponseWithNaturalLanguage"},
+                            {"$ref": "#/components/schemas/ChatPlainResponse"},
+                        ]
+                    },
+                    "examples": {
+                        "medical_non_stream": {
+                            "summary": "medical（stream=false）",
+                            "value": {
+                                "toolCall": {
+                                    "tools": [
+                                        {
+                                            "serverName": "report-api-mcp",
+                                            "toolName": "surgicalReport.findByCaseCode",
+                                            "parameters": {"caseCode": "CASE-202510"},
+                                        }
+                                    ],
+                                    "result": {"reports": []},
+                                    "status": "success",
+                                    "error_message": None,
+                                },
+                                "answer": "案號 CASE-202510 共有 0 筆手術報告（請確認資料或查詢條件）。",
+                            },
+                        },
+                        "intro_non_stream": {
+                            "summary": "intro/other（stream=false）",
+                            "value": {
+                                "time": "2026-01-27T00:00:00Z",
+                                "answer": "我是醫療助理，使用的是開源模型，由喬泰資訊科技整合串流提供使用。",
+                            },
+                        },
+                    },
+                },
                 "text/event-stream": {
                     "schema": {"type": "string"},
                     "examples": {
-                        "sample": {
-                            "summary": "SSE sample",
+                        "medical": {
+                            "summary": "medical（stream=true, toolResult=full）",
                             "value": (
                                 "event: status\n"
                                 "data: {\"id\":\"abc12345\",\"phase\":\"api_received\",\"time\":\"2026-01-27T00:00:00Z\"}\n\n"
                                 "event: status\n"
+                                "data: {\"id\":\"abc12345\",\"phase\":\"intent_classify_start\",\"time\":\"2026-01-27T00:00:00Z\"}\n\n"
+                                "event: status\n"
+                                "data: {\"id\":\"abc12345\",\"phase\":\"intent_classify_done\",\"time\":\"2026-01-27T00:00:00Z\",\"intent\":\"medical\"}\n\n"
+                                "event: status\n"
                                 "data: {\"id\":\"abc12345\",\"phase\":\"tool_call_start\",\"time\":\"2026-01-27T00:00:00Z\"}\n\n"
                                 "event: tool_call\n"
                                 "data: {\"id\":\"abc12345\",\"time\":\"2026-01-27T00:00:00Z\",\"mode\":\"full\",\"toolCall\":{...}}\n\n"
+                                "event: status\n"
+                                "data: {\"id\":\"abc12345\",\"phase\":\"tool_call_done\",\"time\":\"2026-01-27T00:00:00Z\",\"status\":\"success\",\"tool\":\"surgicalReport.findByOperationStartTimeRange\",\"reportsCount\":16}\n\n"
                                 "event: delta\n"
                                 "data: {\"id\":\"abc12345\",\"text\":\"在 2025 年 10 月共有 16 筆手術報告...\"}\n\n"
                                 "event: done\n"
                                 "data: {\"id\":\"abc12345\",\"time\":\"2026-01-27T00:00:01Z\",\"answer\":\"...\"}\n\n"
+                            ),
+                        },
+                        "intro": {
+                            "summary": "intro（stream=true）",
+                            "value": (
+                                "event: status\n"
+                                "data: {\"id\":\"def67890\",\"phase\":\"api_received\",\"time\":\"2026-01-27T00:00:00Z\"}\n\n"
+                                "event: status\n"
+                                "data: {\"id\":\"def67890\",\"phase\":\"intent_classify_done\",\"time\":\"2026-01-27T00:00:00Z\",\"intent\":\"intro\"}\n\n"
+                                "event: delta\n"
+                                "data: {\"id\":\"def67890\",\"text\":\"我是醫療助理，使用的是開源模型，由喬泰資訊科技整合串流提供使用。\"}\n\n"
+                                "event: done\n"
+                                "data: {\"id\":\"def67890\",\"time\":\"2026-01-27T00:00:00Z\",\"answer\":\"...\"}\n\n"
+                            ),
+                        },
+                        "other": {
+                            "summary": "other（stream=true）",
+                            "value": (
+                                "event: status\n"
+                                "data: {\"id\":\"ghi13579\",\"phase\":\"api_received\",\"time\":\"2026-01-27T00:00:00Z\"}\n\n"
+                                "event: status\n"
+                                "data: {\"id\":\"ghi13579\",\"phase\":\"intent_classify_done\",\"time\":\"2026-01-27T00:00:00Z\",\"intent\":\"other\"}\n\n"
+                                "event: delta\n"
+                                "data: {\"id\":\"ghi13579\",\"text\":\"我目前只處理『手術報告查詢』...\"}\n\n"
+                                "event: done\n"
+                                "data: {\"id\":\"ghi13579\",\"time\":\"2026-01-27T00:00:00Z\",\"answer\":\"...\"}\n\n"
                             ),
                         }
                     },
