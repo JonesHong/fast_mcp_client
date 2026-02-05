@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -339,36 +340,80 @@ class MCPClientAgent:
         self._prompt_cache.clear()
 
     def _get_time_context(self, current_time: Optional[datetime] = None) -> str:
+        tz_name = os.getenv("FAST_MCP_TIMEZONE") or "Asia/Taipei"
+        tz = ZoneInfo(tz_name)
+
+        def to_utc_z(dt: datetime) -> str:
+            return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         if current_time is None:
-            current_time = datetime.now(timezone.utc)
-        current_time_str = current_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            current_time = datetime.now(tz)
+        else:
+            if current_time.tzinfo is None:
+                current_time = current_time.replace(tzinfo=timezone.utc).astimezone(tz)
+            else:
+                current_time = current_time.astimezone(tz)
+
+        current_time_utc = current_time.astimezone(timezone.utc)
+        current_time_str = current_time_utc.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
         current_date_str = current_time.strftime("%Y-%m-%d")
         current_year = current_time.year
         current_month = current_time.month
 
-        start_of_today = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_of_week = start_of_today - timedelta(days=current_time.weekday())
-        start_of_month = current_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        start_of_year = current_time.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        start_of_today_local = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_today_local = start_of_today_local + timedelta(days=1) - timedelta(seconds=1)
+
+        start_of_week_local = start_of_today_local - timedelta(days=current_time.weekday())  # Mon
+        end_of_week_local = start_of_week_local + timedelta(days=7) - timedelta(seconds=1)
+
+        start_of_last_week_local = start_of_week_local - timedelta(days=7)
+        end_of_last_week_local = start_of_week_local - timedelta(seconds=1)
+
+        start_of_two_weeks_ago_local = start_of_week_local - timedelta(days=14)
+        end_of_two_weeks_ago_local = start_of_last_week_local - timedelta(seconds=1)
+
+        start_of_month_local = current_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if current_month == 12:
+            next_month_local = start_of_month_local.replace(year=current_year + 1, month=1)
+        else:
+            next_month_local = start_of_month_local.replace(month=current_month + 1)
+        end_of_month_local = next_month_local - timedelta(seconds=1)
+
+        start_of_year_local = current_time.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        start_of_next_year_local = start_of_year_local.replace(year=current_year + 1)
+        end_of_year_local = start_of_next_year_local - timedelta(seconds=1)
 
         return f"""
 CURRENT TIME CONTEXT (Use this for time parameter extraction):
+- Timezone (Local): {tz_name} (default: Asia/Taipei, UTC+8)
+- Current Time (Local): {current_time.replace(microsecond=0).isoformat()}
 - Current Time (UTC): {current_time_str}
-- Current Date: {current_date_str}
-- Current Year: {current_year}
-- Current Month: {current_month}
-- Start of Today: {start_of_today.strftime("%Y-%m-%dT%H:%M:%SZ")}
-- Start of This Week: {start_of_week.strftime("%Y-%m-%dT%H:%M:%SZ")}
-- Start of This Month: {start_of_month.strftime("%Y-%m-%dT%H:%M:%SZ")}
-- Start of This Year: {start_of_year.strftime("%Y-%m-%dT%H:%M:%SZ")}
+- Current Date (Local): {current_date_str}
+- Current Year (Local): {current_year}
+- Current Month (Local): {current_month}
+- Today (Local) Start (UTC): {to_utc_z(start_of_today_local)}
+- Today (Local) End (UTC): {to_utc_z(end_of_today_local)}
+- This Week (Mon-Sun, Local) Start (UTC): {to_utc_z(start_of_week_local)}
+- This Week (Mon-Sun, Local) End (UTC): {to_utc_z(end_of_week_local)}
+- This Month (Local) Start (UTC): {to_utc_z(start_of_month_local)}
+- This Month (Local) End (UTC): {to_utc_z(end_of_month_local)}
+- This Year (Local) Start (UTC): {to_utc_z(start_of_year_local)}
+- This Year (Local) End (UTC): {to_utc_z(end_of_year_local)}
 
 TIME EXTRACTION GUIDELINES:
-- "今天" / "today" → startTime: {start_of_today.strftime("%Y-%m-%dT%H:%M:%SZ")}, endTime: {current_time_str}
-- "本週" / "this week" → startTime: {start_of_week.strftime("%Y-%m-%dT%H:%M:%SZ")}, endTime: {current_time_str}
-- "這個月" / "this month" → startTime: {start_of_month.strftime("%Y-%m-%dT%H:%M:%SZ")}, endTime: {current_time_str}
-- "今年" / "this year" → startTime: {start_of_year.strftime("%Y-%m-%dT%H:%M:%SZ")}, endTime: {current_time_str}
-- "最近一週" / "past week" → startTime: {(current_time - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")}, endTime: {current_time_str}
-- "最近一個月" / "past month" → startTime: {(current_time - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")}, endTime: {current_time_str}
+- Default year: interpret month-only queries as {current_year} unless user specifies another year.
+- Use LOCAL calendar boundaries (Asia/Taipei) and then CONVERT to UTC ISO Z.
+- "今天" → start: {to_utc_z(start_of_today_local)}, end: {to_utc_z(end_of_today_local)}
+- "昨天" → start: {to_utc_z(start_of_today_local - timedelta(days=1))}, end: {to_utc_z(end_of_today_local - timedelta(days=1))}
+- "前天" → start: {to_utc_z(start_of_today_local - timedelta(days=2))}, end: {to_utc_z(end_of_today_local - timedelta(days=2))}
+- "明天" → start: {to_utc_z(start_of_today_local + timedelta(days=1))}, end: {to_utc_z(end_of_today_local + timedelta(days=1))}
+- "後天" → start: {to_utc_z(start_of_today_local + timedelta(days=2))}, end: {to_utc_z(end_of_today_local + timedelta(days=2))}
+- "本週/這週" (Mon-Sun) → start: {to_utc_z(start_of_week_local)}, end: {to_utc_z(end_of_week_local)}
+- "上週/上周" (Mon-Sun) → start: {to_utc_z(start_of_last_week_local)}, end: {to_utc_z(end_of_last_week_local)}
+- "兩週前/两周前" (Mon-Sun) → start: {to_utc_z(start_of_two_weeks_ago_local)}, end: {to_utc_z(end_of_two_weeks_ago_local)}
+- "這個月/本月" → start: {to_utc_z(start_of_month_local)}, end: {to_utc_z(end_of_month_local)}
+- "今年" → start: {to_utc_z(start_of_year_local)}, end: {to_utc_z(end_of_year_local)}
+- "最近一週" / "past week" → start: {to_utc_z(current_time - timedelta(days=7))}, end: {current_time_str}
 - Always use ISO format: YYYY-MM-DDTHH:MM:SSZ
 """
 
@@ -408,6 +453,569 @@ Parameters:
             time_context=self._get_time_context(),
             tool_entries="".join(tool_entries),
         )
+
+    def _tz(self) -> ZoneInfo:
+        tz_name = os.getenv("FAST_MCP_TIMEZONE") or "Asia/Taipei"
+        return ZoneInfo(tz_name)
+
+    def _extract_case_code_from_query(self, user_query: str) -> Optional[str]:
+        """
+        Extract caseCode (案號/病例代號/病歷代號) from a query.
+        Supports:
+          - Explicit patterns like CASE-202510
+          - Keyword-based extraction: "案號 ABC123", "病例代號: X-01/02", "caseCode=..."
+        """
+        import re
+
+        q = (user_query or "").strip()
+        if not q:
+            return None
+
+        # Keep legacy CASE-* detection (still common).
+        m_case = re.search(r"\bCASE[-_A-Za-z0-9]+\b", q)
+        if m_case:
+            return m_case.group(0).strip()
+
+        keywords = [
+            "案號",
+            "病例代號",
+            "病歷代號",
+            "casecode",
+            "case code",
+        ]
+        kw_pat = "|".join(re.escape(k) for k in keywords)
+
+        # Prefer quoted values; otherwise, accept a conservative token charset.
+        m = re.search(
+            rf"(?:{kw_pat})\s*(?:[:：=]|是|為)?\s*(?:「([^」]{{1,128}})」|\"([^\"]{{1,128}})\"|'([^']{{1,128}})'|([A-Za-z0-9][A-Za-z0-9._/\\-]{{0,127}}))",
+            q,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+
+        value = next((g for g in m.groups() if g), None)
+        if not value:
+            return None
+
+        value = value.strip().strip("，。,.、;；:：")
+        value = value.strip()
+        return value or None
+
+    def _extract_report_id_from_query(self, user_query: str) -> Optional[str]:
+        """
+        Extract report id (手術單號 / 報告 id) from a query.
+        Supports:
+          - UUID
+          - Keyword-based extraction: "手術單號 SR-000001", "id: xxx"
+        """
+        import re
+
+        q = (user_query or "").strip()
+        if not q:
+            return None
+
+        q_lower = q.lower()
+        m_uuid = re.search(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", q_lower)
+        if m_uuid:
+            return m_uuid.group(0)
+
+        # Only extract "id" when user explicitly indicates it's an identifier.
+        keywords = [
+            "手術單號",
+            "手術單",
+            "手術id",
+            "報告單號",
+            "報告id",
+            "report id",
+            "reportid",
+            "id:",
+            "id=",
+        ]
+        kw_pat = "|".join(re.escape(k) for k in keywords)
+
+        m = re.search(
+            rf"(?:{kw_pat})\s*(?:[:：=]|是|為)?\s*(?:「([^」]{{1,128}})」|\"([^\"]{{1,128}})\"|'([^']{{1,128}})'|([A-Za-z0-9][A-Za-z0-9._/\\-]{{0,127}}))",
+            q,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+
+        value = next((g for g in m.groups() if g), None)
+        if not value:
+            return None
+        value = value.strip().strip("，。,.、;；:：")
+        return value or None
+
+    def _to_utc_z(self, dt: datetime) -> str:
+        return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _local_day_range_utc(self, local_date: datetime.date) -> tuple[str, str]:
+        tz = self._tz()
+        start_local = datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0, tzinfo=tz)
+        end_local = start_local + timedelta(days=1) - timedelta(seconds=1)
+        return self._to_utc_z(start_local), self._to_utc_z(end_local)
+
+    def _local_week_range_utc(self, anchor_local: datetime, weeks_ago: int = 0) -> tuple[str, str]:
+        tz = self._tz()
+        if anchor_local.tzinfo is None:
+            anchor_local = anchor_local.replace(tzinfo=tz)
+        anchor_local = anchor_local.astimezone(tz)
+        start_of_today = anchor_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_week = start_of_today - timedelta(days=anchor_local.weekday()) - timedelta(days=7 * weeks_ago)
+        end_of_week = start_of_week + timedelta(days=7) - timedelta(seconds=1)
+        return self._to_utc_z(start_of_week), self._to_utc_z(end_of_week)
+
+    def _local_month_range_utc(self, year: int, month: int) -> tuple[str, str]:
+        tz = self._tz()
+        start = datetime(year, month, 1, 0, 0, 0, tzinfo=tz)
+        if month == 12:
+            next_month = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=tz)
+        else:
+            next_month = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=tz)
+        end = next_month - timedelta(seconds=1)
+        return self._to_utc_z(start), self._to_utc_z(end)
+
+    def _local_year_range_utc(self, year: int) -> tuple[str, str]:
+        tz = self._tz()
+        start = datetime(year, 1, 1, 0, 0, 0, tzinfo=tz)
+        end = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=tz) - timedelta(seconds=1)
+        return self._to_utc_z(start), self._to_utc_z(end)
+
+    def _parse_time_ranges_from_query(self, user_query: str) -> list[tuple[str, str]]:
+        """
+        Extract one or more (start,end) UTC Z ranges from the user query.
+        Rules:
+        - Default timezone: Asia/Taipei (+8) via FAST_MCP_TIMEZONE
+        - Default year: current year in local timezone
+        """
+        import re
+
+        q = user_query or ""
+        tz = self._tz()
+        now_local = datetime.now(tz)
+
+        # 1) Explicit ISO timestamps (Z or offset): use as-is (normalize to Z)
+        iso = re.findall(
+            r"\b(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\b",
+            q,
+        )
+        if len(iso) >= 2:
+            def _to_z(s: str) -> str:
+                s = s.strip()
+                if s.endswith("Z"):
+                    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.fromisoformat(s)
+                return self._to_utc_z(dt)
+
+            return [(_to_z(iso[0]), _to_z(iso[1]))]
+
+        # 2) Explicit dates: YYYY-MM-DD or YYYY/MM/DD (treat as LOCAL day boundaries)
+        dates = re.findall(r"\b(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\b", q)
+        if len(dates) >= 2:
+            y1, m1, d1 = (int(dates[0][0]), int(dates[0][1]), int(dates[0][2]))
+            y2, m2, d2 = (int(dates[1][0]), int(dates[1][1]), int(dates[1][2]))
+            start_z, _ = self._local_day_range_utc(datetime(y1, m1, d1).date())
+            _, end_z = self._local_day_range_utc(datetime(y2, m2, d2).date())
+            return [(start_z, end_z)]
+        if len(dates) == 1:
+            y, m, d = (int(dates[0][0]), int(dates[0][1]), int(dates[0][2]))
+            start_z, end_z = self._local_day_range_utc(datetime(y, m, d).date())
+            return [(start_z, end_z)]
+
+        # 3) Relative day keywords (can be multiple)
+        day_offsets = {
+            "前天": -2,
+            "昨天": -1,
+            "昨日": -1,
+            "今天": 0,
+            "明天": 1,
+            "後天": 2,
+        }
+        matched_days: list[int] = []
+        for k, off in day_offsets.items():
+            if k in q:
+                matched_days.append(off)
+        matched_days = sorted(set(matched_days))
+        if matched_days:
+            ranges: list[tuple[str, str]] = []
+            for off in matched_days:
+                local_date = (now_local + timedelta(days=off)).date()
+                ranges.append(self._local_day_range_utc(local_date))
+            return ranges
+
+        # 4) Week keywords (Mon-Sun)
+        # N weeks ago (calendar week Mon-Sun)
+        # Example: "四周前" => weeks_ago=4
+        def _parse_zh_int_week(s: str) -> Optional[int]:
+            s = (s or "").strip()
+            if not s:
+                return None
+            if s.isdigit():
+                return int(s)
+            mapping = {
+                "一": 1,
+                "二": 2,
+                "兩": 2,
+                "三": 3,
+                "四": 4,
+                "五": 5,
+                "六": 6,
+                "七": 7,
+                "八": 8,
+                "九": 9,
+                "十": 10,
+                "十一": 11,
+                "十二": 12,
+            }
+            return mapping.get(s)
+
+        m_weeks_ago = re.search(r"(\d+)\s*(?:個|个)?\s*(?:週|周|星期)前", q) or re.search(
+            r"(十一|十二|十|一|二|兩|三|四|五|六|七|八|九)\s*(?:個|个)?\s*(?:週|周|星期)前",
+            q,
+        )
+        if m_weeks_ago:
+            weeks_ago = _parse_zh_int_week(m_weeks_ago.group(1))
+            if weeks_ago and weeks_ago > 0:
+                start_z, end_z = self._local_week_range_utc(now_local, weeks_ago=weeks_ago)
+                return [(start_z, end_z)]
+
+        if "兩周前" in q or "两周前" in q or "兩週前" in q or "两週前" in q or "兩星期前" in q or "两星期前" in q:
+            start_z, end_z = self._local_week_range_utc(now_local, weeks_ago=2)
+            return [(start_z, end_z)]
+        if "上周" in q or "上週" in q or "上星期" in q:
+            start_z, end_z = self._local_week_range_utc(now_local, weeks_ago=1)
+            return [(start_z, end_z)]
+        if "本週" in q or "這週" in q or "这周" in q or "本周" in q or "本星期" in q or "這星期" in q or "这星期" in q:
+            start_z, end_z = self._local_week_range_utc(now_local, weeks_ago=0)
+            return [(start_z, end_z)]
+        if "最近一週" in q or "最近一周" in q or "近一週" in q or "近一周" in q:
+            start_dt = now_local - timedelta(days=7)
+            return [(self._to_utc_z(start_dt), self._to_utc_z(now_local))]
+
+        # 5) Year/month keywords
+        # N months ago (calendar month)
+        # Example: "兩個月前" (when now is 2026-01) => 2025-11-01..2025-11-30 (local)
+        def _parse_zh_int(s: str) -> Optional[int]:
+            s = (s or "").strip()
+            if not s:
+                return None
+            if s.isdigit():
+                return int(s)
+            mapping = {
+                "一": 1,
+                "二": 2,
+                "兩": 2,
+                "三": 3,
+                "四": 4,
+                "五": 5,
+                "六": 6,
+                "七": 7,
+                "八": 8,
+                "九": 9,
+                "十": 10,
+                "十一": 11,
+                "十二": 12,
+            }
+            if s in mapping:
+                return mapping[s]
+            return None
+
+        # NOTE: do NOT use `\\b` here because Chinese characters are treated as non-word and can break matching.
+        m_months_ago = re.search(
+            r"(\d+)\s*(?:個|个)?\s*月(?:前|以前)",
+            q,
+        ) or re.search(
+            r"(十一|十二|十|一|二|兩|三|四|五|六|七|八|九)\s*(?:個|个)?\s*月(?:前|以前)",
+            q,
+        )
+        if m_months_ago:
+            raw = m_months_ago.group(1)
+            months_ago = _parse_zh_int(raw)
+            if months_ago and months_ago > 0:
+                total = now_local.year * 12 + (now_local.month - 1) - months_ago
+                y = total // 12
+                m = (total % 12) + 1
+                start_z, end_z = self._local_month_range_utc(y, m)
+                return [(start_z, end_z)]
+
+        if "今年" in q:
+            start_z, end_z = self._local_year_range_utc(now_local.year)
+            return [(start_z, end_z)]
+        if "去年" in q:
+            year = now_local.year - 1
+            # handle "去年10月"
+            m_last_year_month = re.search(r"去年\s*(\d{1,2})\s*月", q)
+            if m_last_year_month:
+                month = int(m_last_year_month.group(1))
+                if 1 <= month <= 12:
+                    start_z, end_z = self._local_month_range_utc(year, month)
+                    return [(start_z, end_z)]
+            start_z, end_z = self._local_year_range_utc(year)
+            return [(start_z, end_z)]
+        if "前年" in q:
+            year = now_local.year - 2
+            m_prev_year_month = re.search(r"前年\s*(\d{1,2})\s*月", q)
+            if m_prev_year_month:
+                month = int(m_prev_year_month.group(1))
+                if 1 <= month <= 12:
+                    start_z, end_z = self._local_month_range_utc(year, month)
+                    return [(start_z, end_z)]
+            start_z, end_z = self._local_year_range_utc(year)
+            return [(start_z, end_z)]
+
+        if "本月" in q or "這個月" in q or "这个月" in q:
+            start_z, end_z = self._local_month_range_utc(now_local.year, now_local.month)
+            return [(start_z, end_z)]
+        # "再上個月/上上個月" => month before last month (calendar month)
+        if "再上個月" in q or "上上個月" in q or "上上月" in q:
+            y = now_local.year
+            m = now_local.month - 2
+            while m <= 0:
+                y -= 1
+                m += 12
+            start_z, end_z = self._local_month_range_utc(y, m)
+            return [(start_z, end_z)]
+        if "上個月" in q or "上个月" in q:
+            y = now_local.year
+            m = now_local.month - 1
+            if m == 0:
+                y -= 1
+                m = 12
+            start_z, end_z = self._local_month_range_utc(y, m)
+            return [(start_z, end_z)]
+
+        # month with year: 2025/10 or 2025-10 or 2025年10月
+        m_ym = re.search(r"\b(20\d{2})[/-](\d{1,2})\b", q) or re.search(r"\b(20\d{2})\s*年\s*(\d{1,2})\s*月", q)
+        if m_ym:
+            year = int(m_ym.group(1))
+            month = int(m_ym.group(2))
+            if 1 <= month <= 12:
+                start_z, end_z = self._local_month_range_utc(year, month)
+                return [(start_z, end_z)]
+
+        # year only: 2024年 / 2024 年 / 2024年度
+        m_year = re.search(r"(20\d{2})\s*年(?:度)?", q)
+        if m_year:
+            year = int(m_year.group(1))
+            start_z, end_z = self._local_year_range_utc(year)
+            return [(start_z, end_z)]
+
+        # month only: "10月" => default current year (local)
+        m_m = re.search(r"(?<!\d)(\d{1,2})\s*月", q)
+        if m_m:
+            month = int(m_m.group(1))
+            if 1 <= month <= 12:
+                start_z, end_z = self._local_month_range_utc(now_local.year, month)
+                return [(start_z, end_z)]
+
+        return []
+
+    def _apply_time_parsing_and_normalization(
+        self,
+        *,
+        user_query: str,
+        server_name: str,
+        tool_name: str,
+        parameters: Dict[str, Any],
+    ) -> tuple[str, Dict[str, Any]]:
+        """
+        Convert ambiguous/relative time expressions (今天/昨天/上週/10月/今年...) into deterministic UTC ranges
+        and route to the most appropriate time-range tool if available.
+
+        This intentionally does NOT rely on LLM interpretation to avoid timezone/year ambiguity.
+        """
+        if not isinstance(parameters, dict):
+            return tool_name, parameters
+
+        time_tools = {
+            "surgicalReport.findByOperationStartTimeRange",
+            "surgicalReport.findByOperationStartTimeRanges",
+            "surgicalReport.findByCaseCodeAndOperationStartTimeRanges",
+        }
+
+        parsed_ranges = self._parse_time_ranges_from_query(user_query)
+        if not parsed_ranges:
+            if tool_name in time_tools:
+                return tool_name, self._normalize_time_parameters(tool_name, parameters)
+            return tool_name, parameters
+
+        import re
+
+        q_raw = user_query or ""
+        q_lower = q_raw.lower()
+
+        # Only include caseCode when the user explicitly asked for it (or explicitly provided it).
+        # Avoid "sticky" caseCode coming from conversation context / LLM parameters for follow-up queries like "上上個月呢".
+        case_in_query = self._extract_case_code_from_query(q_raw)
+        explicit_case_in_query = bool(case_in_query)
+        case_context_requested = any(
+            k in q_lower
+            for k in [
+                "案號",
+                "病例代號",
+                "病歷代號",
+                "casecode",
+                "case code",
+                "同案號",
+                "同病例",
+                "同病歷",
+                "同一個案",
+                "同一個病例",
+            ]
+        )
+
+        case_code_param = str(parameters.get("caseCode") or "").strip() or None
+        case_code = None
+        if explicit_case_in_query:
+            case_code = case_in_query
+        elif case_context_requested and case_code_param:
+            case_code = case_code_param
+
+        has_range = self._find_client_for_tool(server_name, "surgicalReport.findByOperationStartTimeRange") is not None
+        has_ranges = self._find_client_for_tool(server_name, "surgicalReport.findByOperationStartTimeRanges") is not None
+        has_case_ranges = (
+            self._find_client_for_tool(server_name, "surgicalReport.findByCaseCodeAndOperationStartTimeRanges") is not None
+        )
+
+        if len(parsed_ranges) > 1:
+            ranges_payload = [{"start": s, "end": e} for s, e in parsed_ranges]
+            if case_code and has_case_ranges:
+                next_tool = "surgicalReport.findByCaseCodeAndOperationStartTimeRanges"
+                next_params: Dict[str, Any] = {"caseCode": case_code, "ranges": ranges_payload}
+                return next_tool, self._normalize_time_parameters(next_tool, next_params)
+            if has_ranges:
+                next_tool = "surgicalReport.findByOperationStartTimeRanges"
+                next_params = {"ranges": ranges_payload}
+                return next_tool, self._normalize_time_parameters(next_tool, next_params)
+
+            if has_range:
+                s0, e0 = parsed_ranges[0]
+                next_tool = "surgicalReport.findByOperationStartTimeRange"
+                # Build a clean param object (prevents empty-string optional fields like caseCode="").
+                next_params = {"start": s0, "end": e0}
+                if case_code:
+                    next_params["caseCode"] = case_code
+                return next_tool, self._normalize_time_parameters(next_tool, next_params)
+            return tool_name, parameters
+
+        s0, e0 = parsed_ranges[0]
+        if has_range:
+            next_tool = "surgicalReport.findByOperationStartTimeRange"
+            # Build a clean param object (prevents empty-string optional fields like caseCode="").
+            next_params = {"start": s0, "end": e0}
+            if case_code:
+                next_params["caseCode"] = case_code
+            return next_tool, self._normalize_time_parameters(next_tool, next_params)
+
+        if case_code and has_case_ranges:
+            next_tool = "surgicalReport.findByCaseCodeAndOperationStartTimeRanges"
+            next_params = {"caseCode": case_code, "ranges": [{"start": s0, "end": e0}]}
+            return next_tool, self._normalize_time_parameters(next_tool, next_params)
+
+        if has_ranges:
+            next_tool = "surgicalReport.findByOperationStartTimeRanges"
+            next_params = {"ranges": [{"start": s0, "end": e0}]}
+            return next_tool, self._normalize_time_parameters(next_tool, next_params)
+
+        return tool_name, parameters
+
+    def _normalize_time_parameters(self, tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize/upgrade time parameters to UTC ISO Z, interpreting date-only inputs in Asia/Taipei.
+        """
+        import re
+
+        if not isinstance(parameters, dict):
+            return parameters
+
+        def _normalize_iso(s: str) -> Optional[str]:
+            s = (s or "").strip()
+            if not s:
+                return None
+            # already UTC Z
+            if re.fullmatch(r"20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", s):
+                return s
+            # with offset
+            if re.fullmatch(r"20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}", s):
+                try:
+                    dt = datetime.fromisoformat(s)
+                    return self._to_utc_z(dt)
+                except Exception:
+                    return None
+            # date-only => local day boundary, but caller decides start/end
+            if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", s):
+                return s
+            # date with slashes
+            if re.fullmatch(r"20\d{2}/\d{1,2}/\d{1,2}", s):
+                parts = s.split("/")
+                return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+            return None
+
+        def _date_from_ymd(s: str) -> Optional[datetime.date]:
+            try:
+                y, m, d = s.split("-")
+                return datetime(int(y), int(m), int(d)).date()
+            except Exception:
+                return None
+
+        # Single range
+        if tool_name in {"surgicalReport.findByOperationStartTimeRange"}:
+            start_raw = parameters.get("start")
+            end_raw = parameters.get("end")
+            start_norm = _normalize_iso(start_raw) if isinstance(start_raw, str) else None
+            end_norm = _normalize_iso(end_raw) if isinstance(end_raw, str) else None
+
+            if isinstance(start_norm, str) and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", start_norm):
+                d = _date_from_ymd(start_norm)
+                if d:
+                    start_norm, _ = self._local_day_range_utc(d)
+            if isinstance(end_norm, str) and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", end_norm):
+                d = _date_from_ymd(end_norm)
+                if d:
+                    _, end_norm = self._local_day_range_utc(d)
+
+            out = dict(parameters)
+            if start_norm:
+                out["start"] = start_norm
+            if end_norm:
+                out["end"] = end_norm
+            return out
+
+        # Multiple ranges
+        if tool_name in {"surgicalReport.findByOperationStartTimeRanges", "surgicalReport.findByCaseCodeAndOperationStartTimeRanges"}:
+            ranges = parameters.get("ranges")
+            if not isinstance(ranges, list):
+                return parameters
+            out_ranges: list[dict[str, Any]] = []
+            for r in ranges:
+                if not isinstance(r, dict):
+                    continue
+                start_raw = r.get("start")
+                end_raw = r.get("end")
+                start_norm = _normalize_iso(start_raw) if isinstance(start_raw, str) else None
+                end_norm = _normalize_iso(end_raw) if isinstance(end_raw, str) else None
+                if isinstance(start_norm, str) and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", start_norm):
+                    d = _date_from_ymd(start_norm)
+                    if d:
+                        start_norm, _ = self._local_day_range_utc(d)
+                if isinstance(end_norm, str) and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", end_norm):
+                    d = _date_from_ymd(end_norm)
+                    if d:
+                        _, end_norm = self._local_day_range_utc(d)
+                rr = dict(r)
+                if start_norm:
+                    rr["start"] = start_norm
+                if end_norm:
+                    rr["end"] = end_norm
+                out_ranges.append(rr)
+            out = dict(parameters)
+            out["ranges"] = out_ranges
+            return out
+
+        return parameters
 
     def _get_server_router_prompt(self) -> str:
         server_entries: list[str] = []
@@ -516,36 +1124,24 @@ Tools: {tool_summary}
                     decision.clarification_needed = None
                     return decision
 
-            # Post-normalize common domain intent: CASE-xxx is almost always a caseCode, not a SurgicalReport id.
-            # This prevents the LLM from mistakenly calling findOne(id="CASE-202510") when the user wants a list.
-            import re
-
-            q = user_query
+            # Post-normalize common domain intent:
+            # If user is clearly talking about "案號/病例代號", do NOT treat it as report id.
+            q = user_query or ""
             q_lower = q.lower()
-            m_case = re.search(r"\bCASE[-_A-Za-z0-9]+\b", q)
-            case_code = m_case.group(0) if m_case else None
 
-            wants_case_list = case_code and any(
-                k in q_lower
-                for k in [
-                    "案號",
-                    "病例代號",
-                    "病歷代號",
-                    "casecode",
-                    "case code",
-                    "所有",
-                    "全部",
-                    "列表",
-                    "清單",
-                    "all",
-                ]
+            case_code = self._extract_case_code_from_query(q)
+            wants_case_list = bool(case_code) and any(
+                k in q_lower for k in ["案號", "病例代號", "病歷代號", "casecode", "case code", "所有", "全部", "列表", "清單", "all"]
             )
-            mentions_id = any(k in q_lower for k in ["手術單號", "單號", "report id", "id:"])
+            mentions_id = bool(self._extract_report_id_from_query(q)) or any(
+                k in q_lower for k in ["手術單號", "報告單號", "report id", "id:"]
+            )
             id_param = str(decision.parameters.get("id") or "")
 
             if decision.tool_name == "surgicalReport.findOne" and case_code and not mentions_id:
-                # If the provided id looks like a case code, treat it as caseCode query.
-                if wants_case_list or id_param == case_code:
+                # If the provided id equals the extracted case code (or user asked for case list),
+                # treat it as caseCode query.
+                if wants_case_list or id_param.strip() == case_code.strip():
                     if self._find_client_for_tool(server_name, "surgicalReport.findByCaseCode") is not None:
                         decision.tool_name = "surgicalReport.findByCaseCode"
                         decision.parameters = {"caseCode": case_code}
@@ -640,48 +1236,30 @@ Tools: {tool_summary}
         if any(k in q_lower for k in ["list tools", "tools", "tool", "工具", "有哪些工具", "列出工具"]):
             return "__list_tools__", {}
 
-        # find one by UUID
-        m_id = re.search(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", q_lower)
-        if m_id:
-            return "surgicalReport.findOne", {"id": m_id.group(0)}
+        report_id = self._extract_report_id_from_query(q)
+        if report_id:
+            return "surgicalReport.findOne", {"id": report_id}
 
-        # case code
-        m_case = re.search(r"\bCASE[-_A-Za-z0-9]+\b", q)
-        case_code = m_case.group(0) if m_case else None
+        case_code = self._extract_case_code_from_query(q)
 
-        # date range like 2025-10-01 到 2025-10-31
-        dates = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", q)
-        if len(dates) >= 2:
-            start_date, end_date = dates[0], dates[1]
-            params: Dict[str, Any] = {
-                "start": f"{start_date}T00:00:00Z",
-                "end": f"{end_date}T23:59:59Z",
-            }
+        # Deterministic time parsing (今天/昨天/上週/10月/今年/日期...)
+        parsed_ranges = self._parse_time_ranges_from_query(q)
+        if parsed_ranges:
+            if len(parsed_ranges) > 1 and case_code:
+                return (
+                    "surgicalReport.findByCaseCodeAndOperationStartTimeRanges",
+                    {"caseCode": case_code, "ranges": [{"start": s, "end": e} for s, e in parsed_ranges]},
+                )
+            if len(parsed_ranges) > 1:
+                return (
+                    "surgicalReport.findByOperationStartTimeRanges",
+                    {"ranges": [{"start": s, "end": e} for s, e in parsed_ranges]},
+                )
+            start_z, end_z = parsed_ranges[0]
+            params: Dict[str, Any] = {"start": start_z, "end": end_z}
             if case_code:
                 params["caseCode"] = case_code
             return "surgicalReport.findByOperationStartTimeRange", params
-
-        # month like 2025/10
-        m_month = re.search(r"\b(20\d{2})[/-](\d{1,2})\b", q)
-        if m_month:
-            year = int(m_month.group(1))
-            month = int(m_month.group(2))
-            if 1 <= month <= 12:
-                from datetime import datetime, timezone
-
-                start = datetime(year, month, 1, tzinfo=timezone.utc)
-                if month == 12:
-                    end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-                else:
-                    end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
-
-                params = {
-                    "start": start.isoformat().replace("+00:00", "Z"),
-                    "end": end.isoformat().replace("+00:00", "Z"),
-                }
-                if case_code:
-                    params["caseCode"] = case_code
-                return "surgicalReport.findByOperationStartTimeRange", params
 
         if case_code and any(
             k in q_lower
@@ -819,10 +1397,17 @@ Tools: {tool_summary}
                 error_message=clarification,
             )
 
+        tool_name, parameters = self._apply_time_parsing_and_normalization(
+            user_query=user_query,
+            server_name=decision.server_name,
+            tool_name=decision.tool_name,
+            parameters=decision.parameters,
+        )
+
         return await self._execute_tool(
             decision.server_name,
-            decision.tool_name,
-            decision.parameters,
+            tool_name,
+            parameters,
         )
 
     async def process_query_with_natural_response(

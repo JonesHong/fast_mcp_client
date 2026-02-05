@@ -17,6 +17,7 @@ import warnings
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from typing import Any, Annotated, AsyncIterator, Optional, Literal
+from zoneinfo import ZoneInfo
 
 import ollama
 from fastapi import FastAPI, HTTPException, Request
@@ -24,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.warnings import UnsupportedFieldAttributeWarning
 
 from fast_mcp_client.mcp_client_agent.agent import MCPClientAgent, AgentResponseWithNaturalLanguage
 from fast_mcp_client.mcp_client_agent.client import MCPServerInfo, ToolInfo
@@ -40,6 +42,14 @@ warnings.filterwarnings(
     "ignore",
     category=DeprecationWarning,
     message=r"websockets\.server\.WebSocketServerProtocol is deprecated.*",
+)
+# FastAPI's Pydantic v2 compatibility layer may generate `TypeAdapter(..., FieldInfo)` for body parsing,
+# which triggers noisy warnings about field-only metadata (alias/validation_alias/serialization_alias).
+# It does not affect runtime parsing/serialization for our API.
+warnings.filterwarnings(
+    "ignore",
+    category=UnsupportedFieldAttributeWarning,
+    message=r"The 'alias' attribute with value .* was provided to the `Field\(\)` function.*",
 )
 
 logger = logging.getLogger("fast_mcp_client.gateway")
@@ -59,6 +69,14 @@ def _looks_like_surgical_report_query(message: str) -> bool:
         return False
 
     q_lower = q.lower()
+    # Users often omit the object ("報告") in follow-ups like "四週前呢？"
+    # Treat short, time-like questions as medical in this domain.
+    is_short_followup = (len(q) <= 14) and (
+        ("呢" in q) or q.endswith("?") or q.endswith("？") or q.endswith("嗎") or q.endswith("吗")
+    )
+    reportish = any(k in q for k in ["報告", "手術", "病例", "病歷", "案號", "單號"]) or any(
+        k in q_lower for k in ["casecode", "case code", "case_code", "case-code"]
+    )
 
     # UUID (surgical report id)
     if re.search(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", q_lower):
@@ -73,12 +91,234 @@ def _looks_like_surgical_report_query(message: str) -> bool:
         return True
     if re.search(r"\b20\d{2}-\d{2}-\d{2}\b", q):  # 2025-10-01
         return True
+    if re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", q):  # 2025年10月
+        return True
+    # Year-only is ambiguous in general chat; treat as medical when report-ish wording exists,
+    # or when it's a short follow-up (domain default object is surgical reports).
+    if re.search(r"(20\d{2})\s*年(?:度)?", q) and (reportish or is_short_followup):
+        return True
+
+    # Relative time hints (require "report-ish" wording to reduce false positives)
+    rel_time = any(
+        k in q
+        for k in [
+            "今天",
+            "昨天",
+            "前天",
+            "明天",
+            "後天",
+            "本週",
+            "這週",
+            "本周",
+            "本星期",
+            "這星期",
+            "这星期",
+            "上週",
+            "上周",
+            "上星期",
+            "兩週前",
+            "两週前",
+            "兩周前",
+            "两周前",
+            "兩星期前",
+            "两星期前",
+            "最近一週",
+            "最近一周",
+            "最近一星期",
+            "近一週",
+            "近一周",
+            "近一星期",
+            "本月",
+            "這個月",
+            "这个月",
+            "上個月",
+            "上个月",
+            "今年",
+            "去年",
+            "前年",
+        ]
+    )
+    # "兩個月前/2個月前/月以前" style
+    if ("月前" in q) or ("月以前" in q):
+        rel_time = True
+    # "四周前/4週前" style
+    if ("周前" in q) or ("週前" in q):
+        rel_time = True
+    # "四星期前/4星期前" style
+    if "星期前" in q:
+        rel_time = True
+    if rel_time and (reportish or is_short_followup):
+        return True
 
     # Domain keywords
     if any(k in q_lower for k in ["手術報告", "手術單號", "病例代號", "病歷代號", "案號", "operationstarttime"]):
         return True
 
     return False
+
+
+def _derive_period_context(*, message: str, tool_name: Optional[str], tool_params: Any) -> dict[str, Any] | None:
+    """
+    Provide deterministic time interpretation metadata so the LLM won't "guess" what 去年/上週 means.
+    Source of truth:
+    - If tool_params has start/end (UTC Z), derive local period from them.
+    - Else, fall back to message keywords + local current year.
+    """
+    import re
+
+    tz_name = os.getenv("FAST_MCP_TIMEZONE") or "Asia/Taipei"
+    tz = ZoneInfo(tz_name)
+
+    q = (message or "").strip()
+    if not q:
+        return None
+
+    # Only relevant for time-range tools (or time-like queries).
+    time_like = (
+        any(
+            k in q
+            for k in [
+                "今天",
+                "昨天",
+                "前天",
+                "明天",
+                "後天",
+                "上週",
+                "上周",
+                "上星期",
+                "本週",
+                "本周",
+                "本星期",
+                "兩週前",
+                "两週前",
+                "兩周前",
+                "两周前",
+                "兩星期前",
+                "两星期前",
+                "本月",
+                "這個月",
+                "这个月",
+                "上個月",
+                "上个月",
+                "今年",
+                "去年",
+                "前年",
+            ]
+        )
+        or ("月前" in q)
+        or ("周前" in q)
+        or ("週前" in q)
+        or ("星期前" in q)
+        or bool(
+            re.search(r"\b20\d{2}[/-]\d{1,2}\b", q)  # 2025/10
+            or re.search(r"\b20\d{2}-\d{2}-\d{2}\b", q)  # 2025-10-01
+            or re.search(r"(20\d{2})\s*年(?:度)?", q)  # 2024年 / 2024年度
+            or re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", q)  # 2024年10月
+        )
+    )
+    if not time_like and tool_name not in {
+        "surgicalReport.findByOperationStartTimeRange",
+        "surgicalReport.findByOperationStartTimeRanges",
+        "surgicalReport.findByCaseCodeAndOperationStartTimeRanges",
+    }:
+        return None
+
+    def _parse_utc_z(s: str) -> Optional[datetime]:
+        if not isinstance(s, str):
+            return None
+        ss = s.strip()
+        if not ss:
+            return None
+        try:
+            if ss.endswith("Z"):
+                return datetime.fromisoformat(ss.replace("Z", "+00:00"))
+            return datetime.fromisoformat(ss)
+        except Exception:
+            return None
+
+    start_utc: Optional[datetime] = None
+    end_utc: Optional[datetime] = None
+    if isinstance(tool_params, dict):
+        start_utc = _parse_utc_z(str(tool_params.get("start") or ""))
+        end_utc = _parse_utc_z(str(tool_params.get("end") or ""))
+        # ranges list tool: { ranges: [{start,end}, ...] }
+        if (start_utc is None and end_utc is None) and isinstance(tool_params.get("ranges"), list):
+            starts: list[datetime] = []
+            ends: list[datetime] = []
+            for r in tool_params.get("ranges") or []:
+                if not isinstance(r, dict):
+                    continue
+                s = _parse_utc_z(str(r.get("start") or ""))
+                e = _parse_utc_z(str(r.get("end") or ""))
+                if s:
+                    starts.append(s)
+                if e:
+                    ends.append(e)
+            if starts:
+                start_utc = min(starts)
+            if ends:
+                end_utc = max(ends)
+
+    # Derive local period from tool params if present.
+    if start_utc:
+        start_local = start_utc.astimezone(tz)
+        end_local = (end_utc.astimezone(tz) if end_utc else None)
+        year = start_local.year
+        month = start_local.month
+        text = f"{year:04d}年"
+        if end_local:
+            if start_local.year == end_local.year and start_local.month == end_local.month:
+                text = f"{year:04d}年{month:02d}月"
+            else:
+                text = f"{start_local.year:04d}-{start_local.month:02d} ～ {end_local.year:04d}-{end_local.month:02d}"
+
+        return {
+            "timezone": tz_name,
+            "localYear": year,
+            "localMonth": month,
+            "localStart": start_local.replace(microsecond=0).isoformat(),
+            "localEnd": end_local.replace(microsecond=0).isoformat() if end_local else None,
+            "text": text,
+            "source": "toolParams",
+        }
+
+    # Fallback: no toolParams start/end; give minimal hint for relative-year wording.
+    now_local = datetime.now(tz)
+    if "去年" in q:
+        return {"timezone": tz_name, "localYear": now_local.year - 1, "text": f"{now_local.year - 1:04d}年", "source": "message"}
+    if "前年" in q:
+        return {"timezone": tz_name, "localYear": now_local.year - 2, "text": f"{now_local.year - 2:04d}年", "source": "message"}
+    if "今年" in q:
+        return {"timezone": tz_name, "localYear": now_local.year, "text": f"{now_local.year:04d}年", "source": "message"}
+    # e.g. 兩個月前/2個月前 -> resolve to calendar month label using local year/month
+    m_months_ago = re.search(r"(\d+)\s*(?:個|个)?\s*月前", q) or re.search(
+        r"(十一|十二|十|一|二|兩|三|四|五|六|七|八|九)\s*(?:個|个)?\s*月前",
+        q,
+    )
+    if m_months_ago:
+        raw = m_months_ago.group(1)
+        mapping = {
+            "一": 1,
+            "二": 2,
+            "兩": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+            "十一": 11,
+            "十二": 12,
+        }
+        months_ago = int(raw) if raw.isdigit() else mapping.get(raw)
+        if months_ago and months_ago > 0:
+            total = now_local.year * 12 + (now_local.month - 1) - months_ago
+            y = total // 12
+            m = (total % 12) + 1
+            return {"timezone": tz_name, "localYear": y, "localMonth": m, "text": f"{y:04d}年{m:02d}月", "source": "message"}
+    return {"timezone": tz_name, "localYear": now_local.year, "text": f"{now_local.year:04d}年", "source": "message"}
 
 
 def _is_admin_model_info_probe(message: str) -> bool:
@@ -241,6 +481,43 @@ async def _llm_classify_intent(
     heuristic_intro = _is_intro_or_model_info_query(message) or _is_admin_model_info_probe(message)
     heuristic_medical = _looks_like_surgical_report_query(message)
 
+    # Deterministic time parsing (e.g., 今天/昨天/上週/去年/10月) from the agent.
+    # This reduces reliance on the LLM intent classifier for date-related messages.
+    time_hint = False
+    try:
+        parse_fn = getattr(agent, "_parse_time_ranges_from_query", None)
+        if callable(parse_fn):
+            time_hint = bool(parse_fn(message))
+    except Exception:
+        time_hint = False
+
+    # In our domain, users often omit the object ("報告") and only ask a time question like:
+    # - "這個月有嗎？", "上上個月呢？"
+    # Treat those as medical when they look like a retrieval query.
+    q = (message or "").strip()
+    q_lower = q.lower()
+    retrieval_words = [
+        "有沒有",
+        "有嗎",
+        "查詢",
+        "查",
+        "搜尋",
+        "列出",
+        "統計",
+        "多少",
+        "幾筆",
+        "幾份",
+        "幾張",
+    ]
+    is_short_followup = (len(q) <= 14) and (("呢" in q) or q.endswith("?") or q.endswith("？"))
+    heuristic_medical_ellipsis = bool(time_hint and (any(w in q_lower for w in retrieval_words) or is_short_followup))
+
+    # Prefer deterministic intent decisions to avoid hangs when Ollama is idle/busy.
+    if heuristic_intro:
+        return "intro"
+    if heuristic_medical or heuristic_medical_ellipsis:
+        return "medical"
+
     system = (
         "You are a strict intent classifier.\n"
         "Classify the user's message into exactly one intent:\n"
@@ -252,24 +529,30 @@ async def _llm_classify_intent(
     )
 
     try:
-        content = await agent.llm.chat_complete_text(
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": message}],
-            temperature=0.0,
-            max_tokens=80,
-            provider=llm_provider,
-            model=llm_model,
+        # Guard against hanging LLM calls (common when Ollama is cold/blocked).
+        content = await asyncio.wait_for(
+            agent.llm.chat_complete_text(
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": message}],
+                temperature=0.0,
+                max_tokens=80,
+                provider=llm_provider,
+                model=llm_model,
+            ),
+            timeout=6.0,
         )
         raw = _extract_first_json_object(content) or content.strip()
         obj = json.loads(raw)
         intent = str(obj.get("intent", "")).strip().lower()
         if intent in {"medical", "intro", "other"}:
+            # Hard guardrails: intro always wins; and time/id/caseCode queries should not be classified as "other".
+            if intent == "other" and (heuristic_medical or heuristic_medical_ellipsis):
+                return "medical"
             return intent
     except Exception:
         pass
 
-    if heuristic_intro:
-        return "intro"
-    if heuristic_medical:
+    # Conservative fallback (non-blocking)
+    if heuristic_medical or heuristic_medical_ellipsis:
         return "medical"
     return "other"
 
@@ -351,24 +634,16 @@ async def _llm_generate_scripted_answer(
 class ChatRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    session_id: Annotated[
-        str,
-        Field(validation_alias="sessionId", serialization_alias="sessionId"),
-    ] = "default"
+    session_id: str = Field("default", alias="sessionId")
     message: str = Field(..., description="使用者訊息（建議包含 UUID / CASE-xxxx / 時間區間）")
     stream: bool = Field(True, description="true: SSE 串流；false: 一次回傳 JSON")
-    llm_provider: Annotated[
-        Optional[str],
-        Field(validation_alias="llmProvider", serialization_alias="llmProvider"),
-    ] = None
-    llm_model: Annotated[
-        Optional[str],
-        Field(validation_alias="llmModel", serialization_alias="llmModel"),
-    ] = None
-    tool_result: Annotated[
-        Literal["none", "summary", "full"],
-        Field(validation_alias="toolResult", serialization_alias="toolResult"),
-    ] = Field("summary", description="SSE 的 tool_call 事件輸出：none/summary/full")
+    llm_provider: Optional[str] = Field(None, alias="llmProvider")
+    llm_model: Optional[str] = Field(None, alias="llmModel")
+    tool_result: Literal["none", "summary", "full"] = Field(
+        "summary",
+        alias="toolResult",
+        description="SSE 的 tool_call 事件輸出：none/summary/full",
+    )
 
 
 class HealthLLMProvider(BaseModel):
@@ -468,6 +743,148 @@ def _parse_duration_seconds(value: Any) -> Optional[float]:
         return num * 86400.0
     return None
 
+
+def _build_tool_call_context(*, message: str, tool_call_full: dict[str, Any]) -> dict[str, Any]:
+    tools = tool_call_full.get("tools") or []
+    tool_name = tools[0].get("toolName") if tools else None
+    tool_params = tools[0].get("parameters") if tools else None
+    result = tool_call_full.get("result") or {}
+
+    def _collect_reports(obj: Any) -> list[dict[str, Any]]:
+        if isinstance(obj, dict) and isinstance(obj.get("reports"), list):
+            return [r for r in obj.get("reports") if isinstance(r, dict)]
+        if isinstance(obj, dict) and isinstance(obj.get("byRange"), list):
+            out: list[dict[str, Any]] = []
+            for bucket in obj.get("byRange") or []:
+                if isinstance(bucket, dict) and isinstance(bucket.get("reports"), list):
+                    out.extend([r for r in bucket.get("reports") if isinstance(r, dict)])
+            return out
+        if isinstance(obj, dict) and isinstance(obj.get("report"), dict):
+            return [obj.get("report")]
+        return []
+
+    reports = _collect_reports(result)
+    reports_count = len(reports)
+
+    def _count_by(key: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for r in reports:
+            v = r.get(key) if isinstance(r, dict) else None
+            if v is None:
+                continue
+            s = str(v)
+            counts[s] = counts.get(s, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    op_start_times = [r.get("operationStartTime") for r in reports if isinstance(r.get("operationStartTime"), str)]
+    op_start_min = min(op_start_times) if op_start_times else None
+    op_start_max = max(op_start_times) if op_start_times else None
+
+    llm_context: dict[str, Any] = {
+        "tool": tool_name,
+        "toolParams": tool_params,
+        "status": tool_call_full.get("status"),
+        "errorMessage": tool_call_full.get("errorMessage"),
+        "reportsCount": reports_count,
+        "operationStartTimeMin": op_start_min,
+        "operationStartTimeMax": op_start_max,
+        "findOne": None,
+        "period": _derive_period_context(message=message, tool_name=tool_name, tool_params=tool_params),
+        "counts": {
+            "byCaseCode": _count_by("caseCode"),
+            "byStatus": _count_by("status"),
+            "byOperationType": _count_by("operationType"),
+        },
+    }
+
+    if tool_name == "surgicalReport.findOne":
+        requested_id = None
+        if isinstance(tool_params, dict):
+            requested_id = tool_params.get("id")
+        returned_id = None
+        returned_case_code = None
+        if isinstance(result, dict) and isinstance(result.get("report"), dict):
+            returned_id = result["report"].get("id")
+            returned_case_code = result["report"].get("caseCode")
+        matched = None
+        if requested_id and returned_id:
+            matched = str(requested_id).strip().lower() == str(returned_id).strip().lower()
+        llm_context["findOne"] = {
+            "requestedId": requested_id,
+            "found": bool(returned_id),
+            "returnedId": returned_id,
+            "returnedCaseCode": returned_case_code,
+            "matched": matched,
+        }
+
+    return llm_context
+
+
+def _build_medical_summary(*, llm_context: dict[str, Any]) -> str:
+    """
+    Deterministic medical summary based strictly on ToolCallContext.
+    Avoids LLM hallucinations (wrong month/year, made-up samples, etc.).
+    """
+    tool = str(llm_context.get("tool") or "").strip()
+    status = str(llm_context.get("status") or "").strip().lower()
+    error_message = str(llm_context.get("errorMessage") or "").strip()
+    reports_count = int(llm_context.get("reportsCount") or 0)
+
+    period = llm_context.get("period") if isinstance(llm_context.get("period"), dict) else None
+    period_text = str(period.get("text") or "").strip() if period else ""
+    if not period_text:
+        period_text = "此期間"
+
+    if status != "success":
+        msg = error_message or "工具呼叫失敗"
+        return (
+            f"目前無法完成查詢（{msg}）。\n"
+            "你可以改用：手術單號(UUID)、病例代號/案號(caseCode)、或手術開始時間區間(start/end) 再試一次。"
+        )
+
+    if tool == "surgicalReport.findOne":
+        find_one = llm_context.get("findOne") if isinstance(llm_context.get("findOne"), dict) else None
+        requested_id = str(find_one.get("requestedId") or "").strip() if find_one else ""
+        matched = bool(find_one.get("matched")) if find_one else False
+        if matched and requested_id:
+            return f"已找到手術單號 {requested_id} 的手術報告。"
+        if requested_id:
+            return f"查無手術單號 {requested_id} 的手術報告。"
+        return "查無符合條件的手術報告。"
+
+    if reports_count <= 0:
+        return f"在{period_text}期間，沒有找到任何手術報告。"
+
+    counts = llm_context.get("counts") if isinstance(llm_context.get("counts"), dict) else {}
+    by_case = counts.get("byCaseCode") if isinstance(counts.get("byCaseCode"), dict) else {}
+    by_status = counts.get("byStatus") if isinstance(counts.get("byStatus"), dict) else {}
+    by_op = counts.get("byOperationType") if isinstance(counts.get("byOperationType"), dict) else {}
+
+    def _fmt_counts(d: dict[str, Any], *, label: str, max_items: int = 12) -> Optional[str]:
+        items: list[tuple[str, int]] = []
+        for k, v in d.items():
+            try:
+                items.append((str(k), int(v)))
+            except Exception:
+                continue
+        if not items:
+            return None
+        items = sorted(items, key=lambda kv: (-kv[1], kv[0]))
+        shown = items[:max_items]
+        parts = [f"{k}（{n}筆）" for k, n in shown]
+        suffix = "…" if len(items) > max_items else ""
+        return f"{label}：{'、'.join(parts)}{suffix}"
+
+    lines: list[str] = [f"在{period_text}期間，共有{reports_count}筆手術報告。"]
+    for s in (
+        _fmt_counts(by_case, label="病例代號/案號"),
+        _fmt_counts(by_status, label="狀態"),
+        _fmt_counts(by_op, label="手術類型"),
+    ):
+        if s:
+            lines.append(s)
+    return "\n".join(lines).strip()
+
 async def _ollama_warmup_loop(
     *,
     host: str,
@@ -530,6 +947,12 @@ async def lifespan(app: FastAPI):
     app.state.cfg = cfg
     app.state.config_path = os.getenv("FAST_MCP_CONFIG") or str(default_config_path())
 
+    # Timezone for deterministic date parsing (e.g., 今天/昨天/上週) inside the agent.
+    # Prefer explicit env override, else use YAML config, else default in agent ("Asia/Taipei").
+    tz_name = str(get_cfg_value(cfg, "time.timezone", "") or "").strip()
+    if tz_name and not os.getenv("FAST_MCP_TIMEZONE"):
+        os.environ["FAST_MCP_TIMEZONE"] = tz_name
+
     openai_api_key = os.getenv("OPENAI_API_KEY")
     openai_model = (
         os.getenv("OPENAI_MODEL")
@@ -587,7 +1010,8 @@ async def lifespan(app: FastAPI):
 
     # Optional: periodic warmup ping to Ollama.
     warmup_cfg = get_cfg_value(cfg, "llm.ollama_warmup", {}) or {}
-    warmup_enabled = bool(warmup_cfg.get("enabled", False))
+    primary_provider = str(get_cfg_value(cfg, "llm.primary_provider", "") or "").strip().lower()
+    warmup_enabled = bool(warmup_cfg.get("enabled", False)) and (primary_provider == "ollama")
     app.state.ollama_warmup_enabled = warmup_enabled
 
     warmup_stop = asyncio.Event()
@@ -634,6 +1058,9 @@ async def lifespan(app: FastAPI):
         else:
             if bool(get_cfg_value(cfg, "logging.verbose", False)):
                 print('[OllamaWarmup] skipped: missing "llm.primary_model"')
+    else:
+        if bool(get_cfg_value(cfg, "logging.verbose", False)) and bool(warmup_cfg.get("enabled", False)):
+            print(f'[OllamaWarmup] skipped: llm.primary_provider="{primary_provider}" (not ollama)')
 
     try:
         yield
@@ -1016,106 +1443,19 @@ async def chat(req: ChatRequest, request: Request):
             yield _sse("done", {"id": request_id, "time": _iso_now(), "answer": answer})
             return
 
-        def _count_by(key: str) -> dict[str, int]:
-            counts: dict[str, int] = {}
-            for r in reports:
-                v = r.get(key)
-                if v is None:
-                    continue
-                s = str(v)
-                counts[s] = counts.get(s, 0) + 1
-            return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        llm_context = _build_tool_call_context(message=req.message, tool_call_full=tool_call_full)
 
-        op_start_times = [r.get("operationStartTime") for r in reports if isinstance(r.get("operationStartTime"), str)]
-        op_start_min = min(op_start_times) if op_start_times else None
-        op_start_max = max(op_start_times) if op_start_times else None
+        yield _sse("status", {"id": request_id, "phase": "summary_build_start", "time": _iso_now()})
+        _phase_log(request_id, "🧾 產生回覆摘要（完全依據 tool_call，不讓 LLM 自由發揮）…")
 
-        llm_context = {
-            "tool": tool_name,
-            "toolParams": tool_params,
-            "status": tool_call_full.get("status"),
-            "errorMessage": tool_call_full.get("errorMessage"),
-            "reportsCount": reports_count,
-            "operationStartTimeMin": op_start_min,
-            "operationStartTimeMax": op_start_max,
-            "findOne": None,
-            "counts": {
-                "byCaseCode": _count_by("caseCode"),
-                "byStatus": _count_by("status"),
-                "byOperationType": _count_by("operationType"),
-            },
-        }
+        answer = _build_medical_summary(llm_context=llm_context)
 
-        if tool_name == "surgicalReport.findOne":
-            requested_id = None
-            if isinstance(tool_params, dict):
-                requested_id = tool_params.get("id")
-            returned_id = None
-            returned_case_code = None
-            if isinstance(result, dict) and isinstance(result.get("report"), dict):
-                returned_id = result["report"].get("id")
-                returned_case_code = result["report"].get("caseCode")
-            matched = None
-            if requested_id and returned_id:
-                matched = str(requested_id).strip().lower() == str(returned_id).strip().lower()
-            llm_context["findOne"] = {
-                "requestedId": requested_id,
-                "found": bool(returned_id),
-                "returnedId": returned_id,
-                "returnedCaseCode": returned_case_code,
-                "matched": matched,
-            }
+        # Stream deterministic answer in chunks (keeps UI behavior consistent).
+        chunk_size = 18
+        for i in range(0, len(answer), chunk_size):
+            yield _sse("delta", {"id": request_id, "text": answer[i : i + chunk_size]})
+            await asyncio.sleep(0)
 
-        llm_context_json = agent._truncate_text(
-            json.dumps(llm_context, ensure_ascii=False, indent=2),
-            limit=8000,
-        )
-        system_prompt = (
-            "You are a helpful assistant.\n"
-            "You MUST answer in Traditional Chinese (繁體中文) unless the user clearly uses another language.\n"
-            "Given the user's query and the MCP tool call context JSON, produce a concise and useful answer.\n"
-            "IMPORTANT: The frontend already receives full tool results via the `tool_call` SSE event.\n"
-            "Therefore, your answer MUST be summary/overview only: totals, statistics, high-level findings.\n"
-            "Terminology:\n"
-            "- 病例代號/案號 = caseCode.\n"
-            "- When counting reports, the unit MUST be 「筆」 (e.g., 「16 筆手術報告」). Do NOT use 份/張/倝.\n"
-            "DO NOT include any examples / samples (e.g., '部分樣本').\n"
-            "DO NOT list individual reports, IDs, file paths, or per-item timestamps.\n"
-            "If tool is surgicalReport.findOne and context.findOne.matched is true, clearly say the requested report was found.\n"
-            "You MUST ONLY use information present in ToolCallContext JSON.\n"
-            "If the user asks something outside the available MCP tools, politely guide them back to supported inputs: id(UUID), caseCode(CASE-xxxx), time range.\n"
-            "If the user asks for full details, politely tell them to inspect the tool_call JSON.\n"
-            "If the tool call failed, explain the error and suggest the next action.\n"
-            "For streaming: output plain text only (no JSON), and do not repeat the tool JSON.\n"
-        )
-
-        yield _sse("status", {"id": request_id, "phase": "llm_stream_start", "time": _iso_now()})
-        _phase_log(request_id, "🧠 開始串流 LLM 回覆…")
-
-        answer_parts: list[str] = []
-        try:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": req.message},
-                {"role": "system", "content": f"ToolCallContext (JSON):\n{llm_context_json}"},
-            ]
-            async for delta in agent.llm.chat_stream_deltas(
-                messages=messages,
-                temperature=0.2,
-                max_tokens=800,
-                provider=req.llm_provider,
-                model=req.llm_model,
-            ):
-                answer_parts.append(delta)
-                yield _sse("delta", {"id": request_id, "text": delta})
-        except Exception as exc:
-            logger.exception("[%s] llm_stream_failed", request_id)
-            yield _sse("error", {"id": request_id, "message": str(exc)})
-
-        answer = "".join(answer_parts).strip()
-        if answer:
-            # Guard against rare incorrect unit characters produced by some LLMs.
-            answer = answer.replace("倝", "筆")
         if answer:
             agent._add_to_conversation("assistant", answer, session=req.session_id)
 
@@ -1136,12 +1476,16 @@ async def chat(req: ChatRequest, request: Request):
         if intent != "medical":
             return await _handle_non_medical(intent)
 
-        response = await agent.process_query_with_natural_response(
+        tool_call = await agent.process_query_only_tool_result(
             req.message,
             session=req.session_id,
             llm_provider=req.llm_provider,
             llm_model=req.llm_model,
         )
+        tool_call_full = tool_call.model_dump(mode="json", by_alias=True)
+        llm_context = _build_tool_call_context(message=req.message, tool_call_full=tool_call_full)
+        answer = _build_medical_summary(llm_context=llm_context)
+        response = AgentResponseWithNaturalLanguage(toolCall=tool_call, answer=answer)
         return JSONResponse(response.model_dump(by_alias=True, mode="json"))
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -1155,16 +1499,56 @@ def _truthy(v: Any) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _running_in_docker() -> bool:
+    if _truthy(os.getenv("FAST_MCP_IN_DOCKER")):
+        return True
+    # Common docker marker file (Linux containers).
+    try:
+        if Path("/.dockerenv").exists():
+            return True
+    except Exception:
+        pass
+    # cgroup hints (best-effort).
+    try:
+        cgroup = Path("/proc/1/cgroup")
+        if cgroup.exists():
+            text = cgroup.read_text(encoding="utf-8", errors="ignore")
+            if any(k in text for k in ("docker", "containerd", "kubepods")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _container_safe_host(host: str) -> str:
+    h = (host or "").strip()
+    if not h:
+        return "0.0.0.0"
+    if h == "localhost" or h.startswith("127."):
+        return "0.0.0.0"
+    return h
+
+
 if __name__ == "__main__":
     import uvicorn
 
     cfg = load_config()
-    host = get_cfg_value(cfg, "gateway.host", "0.0.0.0")
+    host = str(get_cfg_value(cfg, "gateway.host", "0.0.0.0") or "0.0.0.0")
     port = int(get_cfg_value(cfg, "gateway.port", 8081))
     reload = _truthy(get_cfg_value(cfg, "gateway.reload", False))
 
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO)
+
+    if _running_in_docker():
+        safe_host = _container_safe_host(host)
+        if safe_host != host:
+            logging.getLogger("uvicorn.error").warning(
+                "[Docker] gateway.host=%s is not reachable outside container; overriding to %s",
+                host,
+                safe_host,
+            )
+            host = safe_host
 
     uvicorn.run(
         "fast_mcp_client.agent_gateway:app",

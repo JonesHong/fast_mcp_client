@@ -14,6 +14,7 @@
 - Gateway host/port
 - MCP servers（已改為 YAML 管理）
 - Ollama/OpenAI 模型偏好
+- 時區（`time.timezone`，預設 `Asia/Taipei` / UTC+8；用於「今天/昨天/上週/10月」等不明確時間的轉換）
 - （可選）Ollama 定時 warm-up（避免閒置被卸載）
 
 要啟用 warm-up：把 `llm.ollama_warmup.enabled` 設為 `true`，並調整 `interval_seconds`。
@@ -63,6 +64,43 @@ Gateway 啟動後可直接給前端同事使用：
 
 - Swagger UI：`GET /docs`
 - OpenAPI JSON：`GET /openapi.json`
+
+## Docker 部署
+
+### 你需要注意的事（很重要）
+
+- **MCP server 的網路可達性**：Docker 裡的 gateway 要能連到你 `config.yaml` 設定的 `mcp.servers.*.url`。
+  - 若 MCP server 跑在宿主機：Windows/Mac 可用 `http://host.docker.internal:<port>/mcp`
+  - Linux 可能需要 `--add-host host.docker.internal:host-gateway` 或改成同一個 docker network。
+- **SSE 反向代理**：若前面有 Nginx/Cloudflare/ELB，記得避免 buffer、並拉長 idle timeout，否則串流會被切斷。
+- **Secrets**：`OPENAI_API_KEY` 不要寫進 `config.yaml` 或 image，請用環境變數或部署平台的 secret 管理。
+- **ollama**：通常不會放在同一個容器內；建議把 `ollama_host` 指到可連到的 Ollama 服務位置。
+- **容器綁定 host**：容器內若 `gateway.host` 設成 `127.0.0.1/localhost`，外部會連不到；gateway 在 Docker 內會自動改綁到 `0.0.0.0`（不改 port）。
+
+### Build / Run
+
+在 repo 根目錄（`fast_mcp_client`）下：
+
+```powershell
+# build
+docker build -t fast-mcp-client:local .
+
+# run（mount config.yaml）
+docker run --rm -it `
+  -p 8081:8081 `
+  -e FAST_MCP_CONFIG=/app/fast_mcp_client/config.yaml `
+  -e OPENAI_API_KEY=$env:OPENAI_API_KEY `
+  -v \"${PWD}\\config.yaml:/app/fast_mcp_client/config.yaml:ro\" `
+  fast-mcp-client:local
+```
+
+（Linux/macOS 對應版本在 `scripts/linux/docker-run.sh`）
+
+## 常用 scripts
+
+請看 `scripts/README.md`，已整理：
+- Windows：`scripts/windows/*.ps1`
+- Linux：`scripts/linux/*.sh`
 
 ### Response 形狀（方便 data binding）
 

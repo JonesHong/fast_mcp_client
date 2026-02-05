@@ -9,6 +9,10 @@ gateway:
   port: 8081
   reload: false
 
+time:
+  # 解析「今天、昨天、上週、10月」等不明確時間時的預設時區
+  timezone: "Asia/Taipei" # UTC+8
+
 mcp:
   # MCP client 要連的 servers（取代 mcp.local.json / mcp.json）
   servers:

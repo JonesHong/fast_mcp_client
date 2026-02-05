@@ -1,0 +1,14 @@
+.git/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# local-only config (mount it at runtime instead)
+config.yaml
+

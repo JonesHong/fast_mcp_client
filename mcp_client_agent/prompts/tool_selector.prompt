@@ -11,6 +11,10 @@ Your Tasks:
 3. Extract relevant parameters from user input (only include parameters mentioned or inferable)
 4. Respond with tool selection in JSON format
 
+Domain Notes:
+- 病例代號/案號/病歷代號 = caseCode（可能是不規則字串，不一定以 CASE 開頭）
+- 手術單號/報告單號 = id（可能不一定是 UUID）
+
 Special Internal Tool:
 - If the user asks to list/inspect available MCP tools (e.g. "列出 tools", "有哪些工具", "list tools"),
   select the internal tool_name "__list_tools__" with empty parameters {{}}.
