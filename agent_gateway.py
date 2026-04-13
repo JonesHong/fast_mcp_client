@@ -8,6 +8,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -19,13 +20,16 @@ from datetime import datetime, timezone
 from typing import Any, Annotated, AsyncIterator, Optional, Literal
 from zoneinfo import ZoneInfo
 
-import ollama
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+except ImportError:
+    UnsupportedFieldAttributeWarning = None
 
 from fast_mcp_client.mcp_client_agent.agent import MCPClientAgent, AgentResponseWithNaturalLanguage
 from fast_mcp_client.mcp_client_agent.client import MCPServerInfo, ToolInfo
@@ -46,11 +50,12 @@ warnings.filterwarnings(
 # FastAPI's Pydantic v2 compatibility layer may generate `TypeAdapter(..., FieldInfo)` for body parsing,
 # which triggers noisy warnings about field-only metadata (alias/validation_alias/serialization_alias).
 # It does not affect runtime parsing/serialization for our API.
-warnings.filterwarnings(
-    "ignore",
-    category=UnsupportedFieldAttributeWarning,
-    message=r"The 'alias' attribute with value .* was provided to the `Field\(\)` function.*",
-)
+if UnsupportedFieldAttributeWarning is not None:
+    warnings.filterwarnings(
+        "ignore",
+        category=UnsupportedFieldAttributeWarning,
+        message=r"The 'alias' attribute with value .* was provided to the `Field\(\)` function.*",
+    )
 
 logger = logging.getLogger("fast_mcp_client.gateway")
 uvicorn_logger = logging.getLogger("uvicorn.error")
@@ -896,7 +901,12 @@ async def _ollama_warmup_loop(
     stop: asyncio.Event,
     verbose: bool,
 ) -> None:
-    client = ollama.AsyncClient(host=host)
+    try:
+        ollama_mod = importlib.import_module("ollama")
+    except Exception as exc:
+        raise RuntimeError("Failed to import 'ollama' package for warmup.") from exc
+
+    client = ollama_mod.AsyncClient(host=host)
 
     if verbose:
         print(

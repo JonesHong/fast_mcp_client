@@ -167,29 +167,66 @@ class MCPClientAgent:
 
         self.llm = LLMRouter(primary=primary, fallback=fallback)
         
+    def _configured_mcp_servers(self) -> list[tuple[str, str]]:
+        servers: list[tuple[str, str]] = []
+        data = self.mcp_config_data or {}
+        mcp_servers = data.get("mcpServers", {}) if isinstance(data, dict) else {}
+        if not isinstance(mcp_servers, dict):
+            return servers
+        for name, cfg in mcp_servers.items():
+            if not isinstance(cfg, dict):
+                continue
+            url = str(cfg.get("url") or "").strip()
+            if not url:
+                continue
+            servers.append((str(name), url))
+        return servers
+
+    def _no_connected_mcp_server_message(self) -> str:
+        configured = self._configured_mcp_servers()
+        if configured:
+            joined = "；".join([f"{name}={url}" for name, url in configured])
+            return (
+                "目前沒有可用的 MCP server 連線。"
+                "請先啟動對應的 MCP server，並確認 URL 可連線。"
+                f"目前設定：{joined}"
+            )
+        return (
+            "目前沒有可用的 MCP server 連線。"
+            "請先啟動 MCP server，並確認 fast_mcp_client/config.yaml 的 mcp.servers 設定正確。"
+        )
 
     def _log(self, message: str) -> None:
         if self.verbose:
             print(f"[MCPClientAgent] {message}")
 
-    async def initialize(self) -> None:
-        if self.is_initialized:
-            return
+    async def _connect_configured_servers(self) -> None:
+        """
+        Try to connect all configured MCP servers that are not connected yet.
+        Safe to call multiple times (deduplicates by base_url).
+        """
         if self.mcp_config_data is not None:
             config_data = self.mcp_config_data
         else:
             with open(self.mcp_config_path, "r") as f:
                 config_data = json.load(f)
-        for server_name, config in config_data.get("mcpServers", {}).items():
+
+        existing_urls = {str(c.base_url).strip() for c in self.client_list}
+
+        for server_name, config in (config_data.get("mcpServers", {}) or {}).items():
             type = config.get("type", "stdio")
             if type != "streamable_http" and type != "streamable-http":
                 self._log(f"Only 'streamable_http' type is supported. Skipping server '{server_name}' of type '{type}'.")
                 continue
-            url = config.get("url")
+
+            url = str(config.get("url") or "").strip()
             authorization = config.get("headers", {}).get("Authorization") or config.get("headers", {}).get("authorization")
             if not url:
                 self._log(f"No URL found for server '{server_name}'. Skipping.")
                 continue
+            if url in existing_urls:
+                continue
+
             self._log(f"Loading MCP client for server '{server_name}' at URL '{url}'.")
             try:
                 client = await SingleMCPClient.create(
@@ -198,8 +235,14 @@ class MCPClientAgent:
                     verbose=self.verbose,
                 )
                 self.client_list.append(client)
+                existing_urls.add(url)
             except Exception as e:
                 self._log(f"Failed to initialize client for server '{server_name}': {e}")
+
+    async def initialize(self) -> None:
+        if self.is_initialized:
+            return
+        await self._connect_configured_servers()
         self.is_initialized = True
     
     def get_all_clients(self) -> list[SingleMCPClient]:
@@ -547,6 +590,41 @@ Parameters:
             return None
         value = value.strip().strip("，。,.、;；:：")
         return value or None
+
+    def _is_latest_report_query(self, user_query: str) -> bool:
+        q = (user_query or "").strip()
+        if not q:
+            return False
+
+        q_lower = q.lower()
+        explicit_latest = any(
+            k in q_lower
+            for k in [
+                "最近一筆",
+                "最新一筆",
+                "最後一筆",
+                "latest",
+                "most recent",
+            ]
+        )
+
+        # Avoid routing count/list/range requests to "latest one".
+        if any(k in q_lower for k in ["幾筆", "數量", "全部", "所有", "區間", "從", "到", "between"]):
+            return False
+
+        mentions_report_domain = any(
+            k in q_lower
+            for k in [
+                "手術單號",
+                "手術單",
+                "手術報告",
+                "報告",
+                "operation",
+                "report",
+            ]
+        )
+        mentions_latest = explicit_latest or any(k in q_lower for k in ["最近", "最新", "last"])
+        return mentions_latest and mentions_report_domain
 
     def _to_utc_z(self, dt: datetime) -> str:
         return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1148,6 +1226,15 @@ Tools: {tool_summary}
                         decision.clarification_needed = None
                         tool_name_raw = decision.tool_name
 
+            if (
+                self._is_latest_report_query(q)
+                and self._find_client_for_tool(server_name, "surgicalReport.findLatestByCreatedAt") is not None
+            ):
+                decision.tool_name = "surgicalReport.findLatestByCreatedAt"
+                decision.parameters = {}
+                decision.clarification_needed = None
+                tool_name_raw = decision.tool_name
+
             tool_name = tool_name_raw
             if tool_name == "__list_tools__":
                 return decision
@@ -1239,6 +1326,9 @@ Tools: {tool_summary}
         report_id = self._extract_report_id_from_query(q)
         if report_id:
             return "surgicalReport.findOne", {"id": report_id}
+
+        if self._is_latest_report_query(q):
+            return "surgicalReport.findLatestByCreatedAt", {}
 
         case_code = self._extract_case_code_from_query(q)
 
@@ -1361,6 +1451,19 @@ Tools: {tool_summary}
         llm_provider: Optional[str] = None,
         llm_model: Optional[str] = None,
     ) -> ToolCallResult:
+        if not self.client_list:
+            # Gateway may start before MCP server is ready.
+            # Try reconnecting on-demand so users don't need to restart the gateway manually.
+            await self._connect_configured_servers()
+
+        if not self.client_list:
+            return ToolCallResult(
+                tools=None,
+                result={},
+                status=ToolCallStatusEnum.FAILURE,
+                error_message=self._no_connected_mcp_server_message(),
+            )
+
         self._add_to_conversation("user", user_query, session=session)
         if session not in self.conversation_context:
             self.conversation_context[session] = ConversationContext()

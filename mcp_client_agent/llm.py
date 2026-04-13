@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 from typing import Any, AsyncIterator, Optional, Protocol
 
-import ollama
 import openai
 
 
@@ -77,8 +77,14 @@ class OpenAIChatProvider:
 
 class OllamaChatProvider:
     def __init__(self, *, host: Optional[str] = None, keep_alive: float | str | None = None) -> None:
+        try:
+            ollama_mod = importlib.import_module("ollama")
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to import 'ollama' package. Install/repair ollama, or avoid the Ollama provider."
+            ) from exc
         # ollama python client expects host like "http://localhost:11434"
-        self._client = ollama.AsyncClient(host=host) if host else ollama.AsyncClient()
+        self._client = ollama_mod.AsyncClient(host=host) if host else ollama_mod.AsyncClient()
         self._keep_alive = keep_alive
 
     async def complete_text(
