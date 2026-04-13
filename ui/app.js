@@ -16,6 +16,17 @@
   const sendBtn = $("sendBtn");
   const stopBtn = $("stopBtn");
 
+  // Auto-detect base URL when UI is served behind a reverse proxy.
+  // Local dev: https://localhost:8081/ui/          → baseUrl = http://localhost:8081
+  // Reverse proxy: https://host/report/ui/         → baseUrl = https://host/report
+  {
+    const loc = window.location;
+    if (loc.protocol === "http:" || loc.protocol === "https:") {
+      const stripped = loc.pathname.replace(/\/ui\/?$/, "");
+      baseUrlEl.value = loc.origin + stripped;
+    }
+  }
+
   let currentAbortController = null;
   let logOrder = "desc"; // desc: newest first
   const logLines = [];
