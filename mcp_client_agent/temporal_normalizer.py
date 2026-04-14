@@ -866,6 +866,30 @@ _SINGLETON = _TemporalNormalizer()
 # Python 3 re module treats as \w, breaking \b).
 _ISO_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
+# Collapse a chain of 3+ ISO dates joined by 到/至 into a single (earliest, latest)
+# range. Rationale: "去年一月到今年三月" becomes
+#   "2025-01-01 到 2025-01-31 到 2026-03-01 到 2026-03-31"
+# after range_prepass (each period expanded to its own range). The downstream
+# parser takes only the first two dates, so we must collapse the chain into a
+# single outer-bound range before returning.
+_ISO_CHAIN_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})(?:\s*(?:到|至)\s*\d{4}-\d{2}-\d{2}){2,}"
+)
+
+
+def _collapse_iso_chains(text: str) -> str:
+    """Collapse `A 到 B 到 C 到 D` → `A 到 D` (time-sorted first/last)."""
+
+    def _repl(m: re.Match[str]) -> str:
+        chain = m.group(0)
+        dates = re.findall(r"\d{4}-\d{2}-\d{2}", chain)
+        if not dates:
+            return chain
+        sorted_dates = sorted(dates)  # ISO YYYY-MM-DD is lexicographic = chronological
+        return f"{sorted_dates[0]} 到 {sorted_dates[-1]}"
+
+    return _ISO_CHAIN_RE.sub(_repl, text)
+
 
 def _pad_iso_dates(text: str) -> str:
     """Ensure each YYYY-MM-DD has whitespace on both sides."""
@@ -958,6 +982,11 @@ def normalize_temporal_range(text: str, ref: datetime | None = None) -> str:
         # Fall through to single-date normalizer for leftovers
         # (今天/昨天/N天前/N週前/上週一/N年半前 etc.)
         t, _ = _SINGLETON.normalize(t, ref)
+
+        # Collapse "A 到 B 到 C 到 D" chains into single (earliest, latest) range
+        # so "去年一月到今年三月" → "2025-01-01 到 2026-03-31" (not split 4 ways).
+        t = _collapse_iso_chains(t)
+
         return _pad_iso_dates(t)
     except Exception:
         return text
