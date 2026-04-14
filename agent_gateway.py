@@ -1093,6 +1093,12 @@ tags_metadata = [
     },
 ]
 
+# Reverse-proxy prefix: when this gateway is mounted under a sub-path (e.g.
+# https://host/report/), set FAST_MCP_ROOT_PATH=/report so FastAPI emits the
+# correct `servers` entry in OpenAPI and the Swagger UI builds request URLs
+# with the prefix. Leave empty for direct deployment on the root path.
+_ROOT_PATH = os.getenv("FAST_MCP_ROOT_PATH", "").rstrip("/")
+
 app = FastAPI(
     title="Report API Agent Gateway",
     version="0.1.0",
@@ -1108,6 +1114,7 @@ app = FastAPI(
     ),
     openapi_tags=tags_metadata,
     lifespan=lifespan,
+    root_path=_ROOT_PATH,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -1137,6 +1144,10 @@ def _custom_openapi() -> dict:
         routes=app.routes,
         tags=app.openapi_tags,
     )
+    # Inject `servers` entry so Swagger UI builds request URLs with the
+    # reverse-proxy prefix (e.g. `/report/agent/chat` instead of `/agent/chat`).
+    if _ROOT_PATH:
+        schema["servers"] = [{"url": _ROOT_PATH}]
     components = schema.setdefault("components", {})
     schemas = components.setdefault("schemas", {})
     if "AgentResponseWithNaturalLanguage" not in schemas:
