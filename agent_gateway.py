@@ -1117,6 +1117,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ── OpenAPI schema patch ───────────────────────────────────────────────────
+# /agent/chat route uses `openapi_extra` with manual `$ref` to
+# AgentResponseWithNaturalLanguage (defined in mcp_client_agent.agent) and
+# ChatPlainResponse (defined below). FastAPI does not auto-register schemas
+# referenced only via openapi_extra, so Swagger UI fails to resolve them.
+# Wrap `app.openapi` to inject these two schemas after normal generation.
+from fastapi.openapi.utils import get_openapi as _fastapi_get_openapi
+
+
+def _custom_openapi() -> dict:
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = _fastapi_get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=app.openapi_tags,
+    )
+    components = schema.setdefault("components", {})
+    schemas = components.setdefault("schemas", {})
+    if "AgentResponseWithNaturalLanguage" not in schemas:
+        schemas["AgentResponseWithNaturalLanguage"] = (
+            AgentResponseWithNaturalLanguage.model_json_schema(
+                ref_template="#/components/schemas/{model}"
+            )
+        )
+    if "ChatPlainResponse" not in schemas:
+        schemas["ChatPlainResponse"] = ChatPlainResponse.model_json_schema(
+            ref_template="#/components/schemas/{model}"
+        )
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi  # type: ignore[method-assign]
+
+
 ui_dir = Path(__file__).resolve().parent / "ui"
 if ui_dir.exists():
     app.mount("/ui", StaticFiles(directory=str(ui_dir), html=True), name="ui")
