@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .client import SingleMCPClient
 from .llm import LLMBackend, LLMRouter, OllamaChatProvider, OpenAIChatProvider
-from .temporal_normalizer import normalize_temporal
+from .temporal_normalizer import normalize_temporal, normalize_temporal_range
 
 
 class ConversationMessage(BaseModel):
@@ -1452,9 +1452,9 @@ Tools: {tool_summary}
         llm_provider: Optional[str] = None,
         llm_model: Optional[str] = None,
     ) -> ToolCallResult:
-        # Rewrite relative temporal expressions ("上禮拜", "3天前", "last week")
-        # into absolute ISO dates so downstream LLM tool-calling uses exact dates.
-        user_query = normalize_temporal(user_query, datetime.now())
+        # Rewrite relative temporal expressions so LLM tool-calling uses exact dates.
+        # Range version: "上週" → "2026-04-06 到 2026-04-12" (for time-range tools).
+        user_query = normalize_temporal_range(user_query, datetime.now())
         if not self.client_list:
             # Gateway may start before MCP server is ready.
             # Try reconnecting on-demand so users don't need to restart the gateway manually.
@@ -1529,7 +1529,7 @@ Tools: {tool_summary}
         Like process_query_only_tool_result(), but also asks the LLM to generate a
         human-readable final answer based on the tool result.
         """
-        user_query = normalize_temporal(user_query, datetime.now())
+        user_query = normalize_temporal_range(user_query, datetime.now())
         tool_call = await self.process_query_only_tool_result(
             user_query,
             session=session,
