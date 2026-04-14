@@ -749,6 +749,80 @@ def _parse_duration_seconds(value: Any) -> Optional[float]:
     return None
 
 
+# Cap for `toolResult="full"` mode. Prod report-service may return arbitrarily
+# large result sets; we truncate reports beyond this cap to keep single SSE
+# events bounded. Measured: ~2KB per report → 500 reports ≈ 1MB per event.
+_FULL_REPORTS_CAP: int = 500
+
+
+def _apply_full_reports_cap(
+    tool_call_full: dict[str, Any],
+    limit: int = _FULL_REPORTS_CAP,
+) -> dict[str, Any]:
+    """Return a shallow-copied tool_call_full with `result.reports` capped.
+
+    Annotates the trimmed result with `reportsTotal`, `reportsShown`, and
+    `reportsTruncated` so downstream answer templates can display "共 N 筆,
+    顯示前 M 筆" guidance without losing the original total.
+    """
+    result = tool_call_full.get("result")
+    if not isinstance(result, dict):
+        return tool_call_full
+
+    reports = result.get("reports")
+    if isinstance(reports, list) and len(reports) > limit:
+        total = len(reports)
+        new_result = dict(result)
+        new_result["reports"] = reports[:limit]
+        new_result["reportsTotal"] = total
+        new_result["reportsShown"] = limit
+        new_result["reportsTruncated"] = True
+        new_tc = dict(tool_call_full)
+        new_tc["result"] = new_result
+        return new_tc
+
+    # Also handle byRange: cap each bucket's reports proportionally.
+    by_range = result.get("byRange")
+    if isinstance(by_range, list) and by_range:
+        total = sum(
+            len(b.get("reports") or [])
+            for b in by_range
+            if isinstance(b, dict) and isinstance(b.get("reports"), list)
+        )
+        if total > limit:
+            # Cap each bucket to its share of `limit` proportionally, with
+            # a minimum of 1 per non-empty bucket.
+            new_buckets = []
+            remaining = limit
+            for bucket in by_range:
+                if not isinstance(bucket, dict):
+                    new_buckets.append(bucket)
+                    continue
+                bucket_reports = bucket.get("reports") or []
+                if not isinstance(bucket_reports, list) or not bucket_reports:
+                    new_buckets.append(bucket)
+                    continue
+                share = max(1, int(len(bucket_reports) / total * limit))
+                share = min(share, remaining, len(bucket_reports))
+                remaining -= share
+                new_bucket = dict(bucket)
+                new_bucket["reports"] = bucket_reports[:share]
+                new_bucket["reportsTotal"] = len(bucket_reports)
+                new_bucket["reportsShown"] = share
+                new_bucket["reportsTruncated"] = share < len(bucket_reports)
+                new_buckets.append(new_bucket)
+            new_result = dict(result)
+            new_result["byRange"] = new_buckets
+            new_result["reportsTotal"] = total
+            new_result["reportsShown"] = limit - max(remaining, 0)
+            new_result["reportsTruncated"] = True
+            new_tc = dict(tool_call_full)
+            new_tc["result"] = new_result
+            return new_tc
+
+    return tool_call_full
+
+
 def _build_tool_call_context(*, message: str, tool_call_full: dict[str, Any]) -> dict[str, Any]:
     tools = tool_call_full.get("tools") or []
     tool_name = tools[0].get("toolName") if tools else None
@@ -769,7 +843,17 @@ def _build_tool_call_context(*, message: str, tool_call_full: dict[str, Any]) ->
         return []
 
     reports = _collect_reports(result)
-    reports_count = len(reports)
+    reports_shown = len(reports)
+
+    # If cap helper already ran, the original total is on the result dict.
+    reports_truncated = False
+    reports_total = reports_shown
+    if isinstance(result, dict):
+        if result.get("reportsTruncated"):
+            reports_truncated = True
+        if isinstance(result.get("reportsTotal"), int):
+            reports_total = int(result["reportsTotal"])
+    reports_count = reports_total  # canonical "共 N 筆" value
 
     def _count_by(key: str) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -791,6 +875,8 @@ def _build_tool_call_context(*, message: str, tool_call_full: dict[str, Any]) ->
         "status": tool_call_full.get("status"),
         "errorMessage": tool_call_full.get("errorMessage"),
         "reportsCount": reports_count,
+        "reportsShown": reports_shown,
+        "reportsTruncated": reports_truncated,
         "operationStartTimeMin": op_start_min,
         "operationStartTimeMax": op_start_max,
         "findOne": None,
@@ -881,6 +967,16 @@ def _build_medical_summary(*, llm_context: dict[str, Any]) -> str:
         return f"{label}：{'、'.join(parts)}{suffix}"
 
     lines: list[str] = [f"在{period_text}期間，共有{reports_count}筆手術報告。"]
+
+    # If results were truncated (either by full-mode cap or by summary-mode
+    # sample limit), surface the hint so users know to look at the list page.
+    reports_shown = int(llm_context.get("reportsShown") or reports_count)
+    reports_truncated = bool(llm_context.get("reportsTruncated"))
+    if reports_truncated and reports_shown < reports_count:
+        lines.append(
+            f"（單次回傳僅保留前 {reports_shown} 筆原始資料，完整 {reports_count} 筆請至手術報告列表頁查看。）"
+        )
+
     for s in (
         _fmt_counts(by_case, label="病例代號/案號"),
         _fmt_counts(by_status, label="狀態"),
@@ -1441,6 +1537,8 @@ async def chat(req: ChatRequest, request: Request):
         )
         tool_result_mode = (req.tool_result or "summary").strip().lower()
         tool_call_full = tool_call.model_dump(mode="json", by_alias=True)
+        # Cap full-mode reports to avoid multi-MB single SSE events.
+        tool_call_full = _apply_full_reports_cap(tool_call_full)
         tool_call_summary = agent._tool_call_summary_for_llm(tool_call)
 
         if tool_result_mode != "none":
@@ -1554,9 +1652,13 @@ async def chat(req: ChatRequest, request: Request):
             llm_model=req.llm_model,
         )
         tool_call_full = tool_call.model_dump(mode="json", by_alias=True)
+        tool_call_full = _apply_full_reports_cap(tool_call_full)
         llm_context = _build_tool_call_context(message=req.message, tool_call_full=tool_call_full)
         answer = _build_medical_summary(llm_context=llm_context)
-        response = AgentResponseWithNaturalLanguage(toolCall=tool_call, answer=answer)
+        # Re-construct ToolCallResult from the capped dict so the response
+        # body reflects the same truncation annotations.
+        capped_tool_call = tool_call.model_copy(update={"result": tool_call_full.get("result")})
+        response = AgentResponseWithNaturalLanguage(toolCall=capped_tool_call, answer=answer)
         return JSONResponse(response.model_dump(by_alias=True, mode="json"))
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

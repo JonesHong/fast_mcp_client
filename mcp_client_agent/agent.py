@@ -262,6 +262,20 @@ class MCPClientAgent:
             return text
         return f"{text[:limit]}...(truncated)"
 
+    # Caps for summary-mode tool_call payload sent to clients / LLM.
+    # Raised from 5/5×3 to 20/10×5 — clients get a meaningful preview while
+    # keeping SSE event size bounded.
+    _SUMMARY_REPORTS_CAP: int = 20
+    _SUMMARY_BYRANGE_BUCKET_CAP: int = 10
+    _SUMMARY_BYRANGE_PER_BUCKET_CAP: int = 5
+    _SUMMARY_SAMPLE_FIELDS: tuple[str, ...] = (
+        "id",
+        "caseCode",
+        "operationStartTime",
+        "status",
+        "file_path",
+    )
+
     def _tool_call_summary_for_llm(self, tool_call: ToolCallResult) -> dict:
         payload = tool_call.model_dump(mode="json", by_alias=True)
         result = payload.get("result") or {}
@@ -270,11 +284,11 @@ class MCPClientAgent:
         if isinstance(result, dict) and isinstance(result.get("reports"), list):
             reports = result.get("reports") or []
             sample = []
-            for r in reports[:5]:
+            for r in reports[: self._SUMMARY_REPORTS_CAP]:
                 if isinstance(r, dict):
                     sample.append({
                         k: r.get(k)
-                        for k in ["id", "caseCode", "operationStartTime", "status", "file_path"]
+                        for k in self._SUMMARY_SAMPLE_FIELDS
                         if k in r
                     })
                 else:
@@ -282,25 +296,38 @@ class MCPClientAgent:
             result = dict(result)
             result.pop("reports", None)
             result["reportsCount"] = len(reports)
+            result["reportsShown"] = len(sample)
+            result["reportsTruncated"] = len(reports) > self._SUMMARY_REPORTS_CAP
             result["reportsSample"] = sample
             payload["result"] = result
 
         # Compact byRange similarly.
         if isinstance(result, dict) and isinstance(result.get("byRange"), list):
+            raw_buckets = result.get("byRange") or []
             by_range = []
-            for bucket in (result.get("byRange") or [])[:5]:
+            per_cap = self._SUMMARY_BYRANGE_PER_BUCKET_CAP
+            for bucket in raw_buckets[: self._SUMMARY_BYRANGE_BUCKET_CAP]:
                 if isinstance(bucket, dict):
                     bucket_reports = bucket.get("reports") or []
+                    bucket_total = (
+                        len(bucket_reports) if isinstance(bucket_reports, list) else None
+                    )
                     by_range.append({
                         "range": bucket.get("range"),
-                        "reportsCount": len(bucket_reports) if isinstance(bucket_reports, list) else None,
+                        "reportsCount": bucket_total,
+                        "reportsShown": min(bucket_total or 0, per_cap),
+                        "reportsTruncated": (bucket_total or 0) > per_cap,
                         "reportsSample": [
                             {
                                 k: r.get(k)
-                                for k in ["id", "caseCode", "operationStartTime", "status", "file_path"]
+                                for k in self._SUMMARY_SAMPLE_FIELDS
                                 if k in r
                             }
-                            for r in (bucket_reports[:3] if isinstance(bucket_reports, list) else [])
+                            for r in (
+                                bucket_reports[:per_cap]
+                                if isinstance(bucket_reports, list)
+                                else []
+                            )
                             if isinstance(r, dict)
                         ],
                     })
@@ -308,6 +335,11 @@ class MCPClientAgent:
                     by_range.append(bucket)
             result = dict(payload.get("result") or {})
             result["byRange"] = by_range
+            result["byRangeBucketCount"] = len(raw_buckets)
+            result["byRangeBucketsShown"] = len(by_range)
+            result["byRangeTruncated"] = (
+                len(raw_buckets) > self._SUMMARY_BYRANGE_BUCKET_CAP
+            )
             payload["result"] = result
 
         return payload
