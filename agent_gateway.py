@@ -1150,16 +1150,27 @@ def _custom_openapi() -> dict:
         schema["servers"] = [{"url": _ROOT_PATH}]
     components = schema.setdefault("components", {})
     schemas = components.setdefault("schemas", {})
-    if "AgentResponseWithNaturalLanguage" not in schemas:
-        schemas["AgentResponseWithNaturalLanguage"] = (
-            AgentResponseWithNaturalLanguage.model_json_schema(
-                ref_template="#/components/schemas/{model}"
-            )
-        )
-    if "ChatPlainResponse" not in schemas:
-        schemas["ChatPlainResponse"] = ChatPlainResponse.model_json_schema(
+
+    # `/agent/chat` uses `openapi_extra` with manual `$ref` to two Pydantic
+    # models defined outside this file's auto-discovered route models. FastAPI
+    # does not register them, so we generate their json schemas and lift all
+    # transitively referenced `$defs` into `components/schemas` — otherwise
+    # Swagger UI fails with "key not found in object" for nested types like
+    # ToolCallResult / ToolCallInfo / ToolCallStatusEnum.
+    def _inject_model(model_cls: type) -> None:
+        model_schema = model_cls.model_json_schema(
             ref_template="#/components/schemas/{model}"
         )
+        defs = model_schema.pop("$defs", None) or {}
+        for name, def_schema in defs.items():
+            if name not in schemas:
+                schemas[name] = def_schema
+        if model_cls.__name__ not in schemas:
+            schemas[model_cls.__name__] = model_schema
+
+    _inject_model(AgentResponseWithNaturalLanguage)
+    _inject_model(ChatPlainResponse)
+
     app.openapi_schema = schema
     return schema
 
