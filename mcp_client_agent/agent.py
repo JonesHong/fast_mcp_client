@@ -624,6 +624,56 @@ Parameters:
         value = value.strip().strip("，。,.、;；:：")
         return value or None
 
+    # 病人姓名語意上的常見干擾詞（非姓名的 2-4 字 CJK token）
+    _PATIENT_NAME_DENYLIST = frozenset({
+        "手術", "報告", "病人", "病患", "患者", "醫師", "醫生", "護理", "麻醉",
+        "今天", "昨天", "明天", "前天", "後天", "今日", "昨日",
+        "今年", "去年", "明年", "前年", "本年", "本週", "上週", "下週", "本月", "上月", "下月",
+        "這週", "這月", "這個月", "上個月", "下個月", "上禮拜", "下禮拜",
+        "案件", "病例", "病歷", "案號", "全部", "所有", "查詢", "搜尋", "列表", "清單",
+        "資料", "紀錄", "記錄", "結果", "資訊", "詳情",
+        "請問", "請查", "幫我", "可以", "需要", "應該",
+    })
+
+    def _extract_patient_name_from_query(self, user_query: str) -> Optional[str]:
+        """
+        Extract a patient name (純中文 2-4 字) from a query.
+        Conservative: only fires when there's a clear delimiter signal so we don't
+        misclassify generic CJK nouns (手術/報告/病人...) as a name.
+        Patterns:
+          1. CJK 2-4 字 followed by ASCII whitespace (常見輸入: "周建宏 2026年4月...")
+          2. CJK 2-4 字 followed by 的 + (手術|報告|病例|...)
+          3. Query 開頭就是 2-4 字 CJK token，後面接時間標記 (年/月/日/今/昨/上/下/本)
+        """
+        import re
+
+        q = (user_query or "").strip()
+        if not q:
+            return None
+
+        cjk = r"[\u4e00-\u9fff\u3400-\u4dbf]{2,4}"
+
+        candidates: list[str] = []
+
+        # Pattern 1: at start, CJK 2-4 + ASCII whitespace
+        m = re.match(rf"^({cjk})\s", q)
+        if m:
+            candidates.append(m.group(1))
+
+        # Pattern 2: CJK 2-4 + 的 + 手術/報告/病例/病歷/資料/紀錄/記錄
+        for m in re.finditer(rf"({cjk})的(?:手術|報告|病例|病歷|資料|紀錄|記錄|案件)", q):
+            candidates.append(m.group(1))
+
+        # Pattern 3: at start, CJK 2-4 directly followed by a temporal marker
+        m = re.match(rf"^({cjk})(?:今|昨|明|前|後|上|下|本|這|去|今年|2\d{{3}}|\d{{1,2}}月)", q)
+        if m:
+            candidates.append(m.group(1))
+
+        for cand in candidates:
+            if cand and cand not in self._PATIENT_NAME_DENYLIST:
+                return cand
+        return None
+
     def _is_latest_report_query(self, user_query: str) -> bool:
         q = (user_query or "").strip()
         if not q:
@@ -899,7 +949,9 @@ Parameters:
             return [(start_z, end_z)]
 
         # month with year: 2025/10 or 2025-10 or 2025年10月
-        m_ym = re.search(r"\b(20\d{2})[/-](\d{1,2})\b", q) or re.search(r"\b(20\d{2})\s*年\s*(\d{1,2})\s*月", q)
+        # Note: avoid `\b` — Python re treats CJK as `\w`, so "宏2026年4月"
+        # would NOT match `\b(20\d{2})...`. Use explicit non-digit lookbehind.
+        m_ym = re.search(r"(?<!\d)(20\d{2})[/-](\d{1,2})(?!\d)", q) or re.search(r"(?<!\d)(20\d{2})\s*年\s*(\d{1,2})\s*月", q)
         if m_ym:
             year = int(m_ym.group(1))
             month = int(m_ym.group(2))
@@ -908,7 +960,8 @@ Parameters:
                 return [(start_z, end_z)]
 
         # year only: 2024年 / 2024 年 / 2024年度
-        m_year = re.search(r"(20\d{2})\s*年(?:度)?", q)
+        # Must NOT match if followed by "M月" — that case is handled above.
+        m_year = re.search(r"(?<!\d)(20\d{2})\s*年(?:度)?(?!\s*\d{1,2}\s*月)", q)
         if m_year:
             year = int(m_year.group(1))
             start_z, end_z = self._local_year_range_utc(year)
@@ -952,6 +1005,13 @@ Parameters:
             if tool_name in time_tools:
                 return tool_name, self._normalize_time_parameters(tool_name, parameters)
             return tool_name, parameters
+
+        # Preserve findByPatientName: inject deterministic time range as filter,
+        # do NOT reroute to a time-only tool (would lose the patient name filter).
+        if tool_name == "surgicalReport.findByPatientName":
+            s0, e0 = parsed_ranges[0]
+            next_params: Dict[str, Any] = {**(parameters or {}), "start": s0, "end": e0}
+            return tool_name, self._normalize_time_parameters(tool_name, next_params)
 
         import re
 
@@ -1265,6 +1325,26 @@ Tools: {tool_summary}
             ):
                 decision.tool_name = "surgicalReport.findLatestByCreatedAt"
                 decision.parameters = {}
+                decision.clarification_needed = None
+                tool_name_raw = decision.tool_name
+
+            # Patient name reroute: if a 2-4 CJK patient name is detected and the
+            # LLM didn't pick findByPatientName, override (preserving any time range
+            # the LLM already extracted).
+            patient_name = self._extract_patient_name_from_query(q)
+            if (
+                patient_name
+                and decision.tool_name != "surgicalReport.findByPatientName"
+                and self._find_client_for_tool(server_name, "surgicalReport.findByPatientName") is not None
+            ):
+                new_params: Dict[str, Any] = {"name": patient_name}
+                old_params = decision.parameters or {}
+                if old_params.get("start"):
+                    new_params["start"] = old_params["start"]
+                if old_params.get("end"):
+                    new_params["end"] = old_params["end"]
+                decision.tool_name = "surgicalReport.findByPatientName"
+                decision.parameters = new_params
                 decision.clarification_needed = None
                 tool_name_raw = decision.tool_name
 

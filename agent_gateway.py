@@ -908,6 +908,25 @@ def _build_tool_call_context(*, message: str, tool_call_full: dict[str, Any]) ->
             "matched": matched,
         }
 
+    # findLatestByCreatedAt / findByPatientName: surface single-record details
+    # so the deterministic summary builder can render a meaningful one-liner
+    # instead of the multi-record period template.
+    if tool_name in {"surgicalReport.findLatestByCreatedAt", "surgicalReport.findByPatientName"} and reports:
+        first = reports[0] if isinstance(reports[0], dict) else {}
+        llm_context["singleRecord"] = {
+            "id": first.get("id"),
+            "caseCode": first.get("caseCode"),
+            "name": first.get("name"),
+            "status": first.get("status"),
+            "operationType": first.get("operationType"),
+            "operationStartTime": first.get("operationStartTime"),
+            "operationEndTime": first.get("operationEndTime"),
+            "createdAt": first.get("createdAt"),
+        }
+
+    if tool_name == "surgicalReport.findByPatientName" and isinstance(tool_params, dict):
+        llm_context["patientNameQueried"] = tool_params.get("name")
+
     return llm_context
 
 
@@ -923,8 +942,10 @@ def _build_medical_summary(*, llm_context: dict[str, Any]) -> str:
 
     period = llm_context.get("period") if isinstance(llm_context.get("period"), dict) else None
     period_text = str(period.get("text") or "").strip() if period else ""
-    if not period_text:
-        period_text = "此期間"
+
+    def _period_prefix() -> str:
+        # "在{period_text}期間" if known, otherwise empty so caller can fall back.
+        return f"在{period_text}期間" if period_text else ""
 
     if status != "success":
         msg = error_message or "工具呼叫失敗"
@@ -943,8 +964,46 @@ def _build_medical_summary(*, llm_context: dict[str, Any]) -> str:
             return f"查無手術單號 {requested_id} 的手術報告。"
         return "查無符合條件的手術報告。"
 
+    # findLatestByCreatedAt: render single-record one-liner with name + date + caseCode
+    if tool == "surgicalReport.findLatestByCreatedAt":
+        single = llm_context.get("singleRecord") if isinstance(llm_context.get("singleRecord"), dict) else None
+        if not single:
+            return "目前資料中沒有任何手術報告。"
+        bits: list[str] = ["最近一筆手術報告："]
+        name_v = (single.get("name") or "").strip()
+        case_v = (single.get("caseCode") or "").strip()
+        op_start = (single.get("operationStartTime") or "").strip()
+        status_v = (single.get("status") or "").strip()
+        op_type = (single.get("operationType") or "").strip()
+        if name_v:
+            bits.append(f"病人 {name_v}")
+        if case_v:
+            bits.append(f"案號 {case_v}")
+        if op_start:
+            bits.append(f"手術時間 {op_start}")
+        if op_type:
+            bits.append(f"手術類型 {op_type}")
+        if status_v:
+            bits.append(f"狀態 {status_v}")
+        return bits[0] + "，".join(bits[1:]) + "。" if len(bits) > 1 else "目前資料中沒有任何手術報告。"
+
+    # findByPatientName 0-result phrasing
+    if tool == "surgicalReport.findByPatientName" and reports_count <= 0:
+        name_q = (llm_context.get("patientNameQueried") or "").strip()
+        prefix = _period_prefix()
+        if name_q and prefix:
+            return f"{prefix}，沒有找到病人「{name_q}」的手術報告。"
+        if name_q:
+            return f"目前資料中沒有病人「{name_q}」的手術報告。"
+        if prefix:
+            return f"{prefix}，沒有找到任何手術報告。"
+        return "查無符合條件的手術報告。"
+
     if reports_count <= 0:
-        return f"在{period_text}期間，沒有找到任何手術報告。"
+        prefix = _period_prefix()
+        if prefix:
+            return f"{prefix}，沒有找到任何手術報告。"
+        return "查無符合條件的手術報告。"
 
     counts = llm_context.get("counts") if isinstance(llm_context.get("counts"), dict) else {}
     by_case = counts.get("byCaseCode") if isinstance(counts.get("byCaseCode"), dict) else {}
@@ -966,7 +1025,18 @@ def _build_medical_summary(*, llm_context: dict[str, Any]) -> str:
         suffix = "…" if len(items) > max_items else ""
         return f"{label}：{'、'.join(parts)}{suffix}"
 
-    lines: list[str] = [f"在{period_text}期間，共有{reports_count}筆手術報告。"]
+    prefix = _period_prefix()
+    name_q = str(llm_context.get("patientNameQueried") or "").strip()
+    if tool == "surgicalReport.findByPatientName" and name_q:
+        if prefix:
+            header = f"{prefix}，病人「{name_q}」共有 {reports_count} 筆手術報告。"
+        else:
+            header = f"病人「{name_q}」共有 {reports_count} 筆手術報告。"
+    elif prefix:
+        header = f"{prefix}，共有 {reports_count} 筆手術報告。"
+    else:
+        header = f"目前共有 {reports_count} 筆手術報告。"
+    lines: list[str] = [header]
 
     # If results were truncated (either by full-mode cap or by summary-mode
     # sample limit), surface the hint so users know to look at the list page.
