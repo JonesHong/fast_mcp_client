@@ -536,10 +536,23 @@ async def _llm_classify_intent(
     is_short_followup = (len(q) <= 14) and (("呢" in q) or q.endswith("?") or q.endswith("？"))
     heuristic_medical_ellipsis = bool(time_hint and (any(w in q_lower for w in retrieval_words) or is_short_followup))
 
+    # Patient name heuristic: borrow agent._extract_patient_name_from_query
+    # (which already has denylist) to catch "王小美" / "王小美呢" / "王小美的手術"
+    # style queries. Without this the strict LLM classifier falls back to
+    # "other" and the gateway returns canned guidance instead of running the
+    # tool pipeline.
+    heuristic_medical_patient = False
+    try:
+        pn_fn = getattr(agent, "_extract_patient_name_from_query", None)
+        if callable(pn_fn) and pn_fn(message):
+            heuristic_medical_patient = True
+    except Exception:
+        heuristic_medical_patient = False
+
     # Prefer deterministic intent decisions to avoid hangs when Ollama is idle/busy.
     if heuristic_intro:
         return "intro"
-    if heuristic_medical or heuristic_medical_ellipsis:
+    if heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient:
         return "medical"
 
     system = (
@@ -568,15 +581,15 @@ async def _llm_classify_intent(
         obj = json.loads(raw)
         intent = str(obj.get("intent", "")).strip().lower()
         if intent in {"medical", "intro", "other"}:
-            # Hard guardrails: intro always wins; and time/id/caseCode queries should not be classified as "other".
-            if intent == "other" and (heuristic_medical or heuristic_medical_ellipsis):
+            # Hard guardrails: intro always wins; and time/id/caseCode/patient-name queries should not be classified as "other".
+            if intent == "other" and (heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient):
                 return "medical"
             return intent
     except Exception:
         pass
 
     # Conservative fallback (non-blocking)
-    if heuristic_medical or heuristic_medical_ellipsis:
+    if heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient:
         return "medical"
     return "other"
 

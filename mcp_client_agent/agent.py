@@ -644,6 +644,9 @@ Parameters:
           1. CJK 2-4 字 followed by ASCII whitespace (常見輸入: "周建宏 2026年4月...")
           2. CJK 2-4 字 followed by 的 + (手術|報告|病例|...)
           3. Query 開頭就是 2-4 字 CJK token，後面接時間標記 (年/月/日/今/昨/上/下/本)
+          4. Elliptical follow-up: "王小美呢" / "王小美的呢" / "王小美嗎" —
+             跨輪對話切換姓名時的省略補問句型
+          5. Query 整句就是 2-4 CJK token（單獨姓名輸入），例如 "王小美"
         """
         import re
 
@@ -668,6 +671,18 @@ Parameters:
         m = re.match(rf"^({cjk})(?:今|昨|明|前|後|上|下|本|這|去|今年|2\d{{3}}|\d{{1,2}}月)", q)
         if m:
             candidates.append(m.group(1))
+
+        # Pattern 4: elliptical follow-up particle (跨輪切換姓名)
+        #   e.g. "王小美呢", "王小美的呢", "王小美嗎", "王小美呢?"
+        m = re.match(rf"^({cjk})(?:的)?(?:呢|嗎)\s*[?？]?$", q)
+        if m:
+            candidates.append(m.group(1))
+
+        # Pattern 5: query 整句就是 2-4 CJK token (單獨姓名輸入)
+        #   Denylist will reject generic nouns like "手術" / "報告".
+        m = re.fullmatch(cjk, q)
+        if m:
+            candidates.append(m.group(0))
 
         for cand in candidates:
             if cand and cand not in self._PATIENT_NAME_DENYLIST:
@@ -1319,6 +1334,33 @@ Tools: {tool_summary}
                         decision.clarification_needed = None
                         tool_name_raw = decision.tool_name
 
+            # Case code strong-signal reroute: if the CURRENT query has an
+            # explicit case code and neither an explicit temporal marker nor a
+            # patient-name signal, override whatever tool the LLM picked (it
+            # was almost certainly sticky from previous-turn history) to
+            # findByCaseCode. This runs BEFORE the patient-name stickiness
+            # guard so case-code intent wins over leaked patient/time state.
+            _case_reroute_current_patient = self._extract_patient_name_from_query(q)
+            _time_markers_for_reroute = (
+                "今天", "昨天", "明天", "前天", "後天",
+                "上週", "下週", "本週", "這週", "上周", "下周", "本周",
+                "上個月", "下個月", "本月", "這個月", "上月", "下月",
+                "今年", "去年", "明年",
+                "年", "月", "日",
+            )
+            _case_reroute_has_time = any(k in q for k in _time_markers_for_reroute)
+            if (
+                case_code
+                and decision.tool_name != "surgicalReport.findByCaseCode"
+                and _case_reroute_current_patient is None
+                and not _case_reroute_has_time
+                and self._find_client_for_tool(server_name, "surgicalReport.findByCaseCode") is not None
+            ):
+                decision.tool_name = "surgicalReport.findByCaseCode"
+                decision.parameters = {"caseCode": case_code}
+                decision.clarification_needed = None
+                tool_name_raw = decision.tool_name
+
             if (
                 self._is_latest_report_query(q)
                 and self._find_client_for_tool(server_name, "surgicalReport.findLatestByCreatedAt") is not None
@@ -1328,25 +1370,39 @@ Tools: {tool_summary}
                 decision.clarification_needed = None
                 tool_name_raw = decision.tool_name
 
-            # Patient name reroute: if a 2-4 CJK patient name is detected and the
-            # LLM didn't pick findByPatientName, override (preserving any time range
-            # the LLM already extracted).
+            # Patient name reroute: if a 2-4 CJK patient name is detected in
+            # the CURRENT query, force-override the tool to findByPatientName
+            # with that name. Even if the LLM already picked findByPatientName
+            # the name parameter may have leaked from previous-turn history,
+            # so we always rewrite it from the current query. Time range is
+            # only preserved when the LLM's name agrees with the current one
+            # (otherwise it's assumed to be stale bleed).
             patient_name = self._extract_patient_name_from_query(q)
             if (
                 patient_name
-                and decision.tool_name != "surgicalReport.findByPatientName"
                 and self._find_client_for_tool(server_name, "surgicalReport.findByPatientName") is not None
             ):
-                new_params: Dict[str, Any] = {"name": patient_name}
                 old_params = decision.parameters or {}
-                if old_params.get("start"):
-                    new_params["start"] = old_params["start"]
-                if old_params.get("end"):
-                    new_params["end"] = old_params["end"]
-                decision.tool_name = "surgicalReport.findByPatientName"
-                decision.parameters = new_params
-                decision.clarification_needed = None
-                tool_name_raw = decision.tool_name
+                old_name = old_params.get("name")
+                name_disagrees = bool(old_name) and old_name != patient_name
+                needs_override = (
+                    decision.tool_name != "surgicalReport.findByPatientName"
+                    or name_disagrees
+                )
+                if needs_override:
+                    new_params: Dict[str, Any] = {"name": patient_name}
+                    # Preserve time range ONLY when the LLM's name isn't a
+                    # bleed (i.e. either agrees with the current name or
+                    # wasn't set at all).
+                    if not name_disagrees:
+                        if old_params.get("start"):
+                            new_params["start"] = old_params["start"]
+                        if old_params.get("end"):
+                            new_params["end"] = old_params["end"]
+                    decision.tool_name = "surgicalReport.findByPatientName"
+                    decision.parameters = new_params
+                    decision.clarification_needed = None
+                    tool_name_raw = decision.tool_name
 
             # Patient name stickiness guard: if the LLM picked findByPatientName
             # but the CURRENT user query has no extractable patient name, the
