@@ -1348,6 +1348,28 @@ Tools: {tool_summary}
                 decision.clarification_needed = None
                 tool_name_raw = decision.tool_name
 
+            # Patient name stickiness guard: if the LLM picked findByPatientName
+            # but the CURRENT user query has no extractable patient name, the
+            # name almost certainly leaked from previous-turn conversation
+            # history. Reroute to a time-based tool (preserving any time range).
+            if (
+                decision.tool_name == "surgicalReport.findByPatientName"
+                and patient_name is None
+            ):
+                old_params = decision.parameters or {}
+                has_range = bool(old_params.get("start") or old_params.get("end"))
+                range_tool = "surgicalReport.findByOperationStartTimeRange"
+                if has_range and self._find_client_for_tool(server_name, range_tool) is not None:
+                    reroute_params: Dict[str, Any] = {}
+                    if old_params.get("start"):
+                        reroute_params["start"] = old_params["start"]
+                    if old_params.get("end"):
+                        reroute_params["end"] = old_params["end"]
+                    decision.tool_name = range_tool
+                    decision.parameters = reroute_params
+                    decision.clarification_needed = None
+                    tool_name_raw = decision.tool_name
+
             tool_name = tool_name_raw
             if tool_name == "__list_tools__":
                 return decision

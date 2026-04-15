@@ -16,6 +16,7 @@ import time
 import uuid
 import warnings
 from contextlib import asynccontextmanager, suppress
+from calendar import monthrange
 from datetime import datetime, timezone
 from typing import Any, Annotated, AsyncIterator, Optional, Literal
 from zoneinfo import ZoneInfo
@@ -272,8 +273,26 @@ def _derive_period_context(*, message: str, tool_name: Optional[str], tool_param
         month = start_local.month
         text = f"{year:04d}年"
         if end_local:
-            if start_local.year == end_local.year and start_local.month == end_local.month:
-                text = f"{year:04d}年{month:02d}月"
+            same_y = start_local.year == end_local.year
+            same_ym = same_y and start_local.month == end_local.month
+            if same_ym and start_local.day == end_local.day:
+                # Single day: 今天 / 昨天 / 2026-04-15
+                text = f"{year:04d}年{month:02d}月{start_local.day:02d}日"
+            elif same_ym:
+                last_day = monthrange(start_local.year, start_local.month)[1]
+                if start_local.day == 1 and end_local.day == last_day:
+                    # Full calendar month: 本月 / 2026年4月
+                    text = f"{year:04d}年{month:02d}月"
+                else:
+                    # Partial same-month range: 本週 / 最近3天 / 4月10日到15日
+                    text = f"{year:04d}年{month:02d}月{start_local.day:02d}日～{end_local.day:02d}日"
+            elif (
+                same_y
+                and start_local.month == 1 and start_local.day == 1
+                and end_local.month == 12 and end_local.day == 31
+            ):
+                # Full calendar year: 今年 / 2026年
+                text = f"{year:04d}年"
             else:
                 text = f"{start_local.year:04d}-{start_local.month:02d} ～ {end_local.year:04d}-{end_local.month:02d}"
 
