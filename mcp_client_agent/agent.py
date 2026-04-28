@@ -632,27 +632,78 @@ Parameters:
         "這週", "這月", "這個月", "上個月", "下個月", "上禮拜", "下禮拜",
         "案件", "病例", "病歷", "案號", "全部", "所有", "查詢", "搜尋", "列表", "清單",
         "資料", "紀錄", "記錄", "結果", "資訊", "詳情",
-        "請問", "請查", "幫我", "可以", "需要", "應該",
+        "請問", "請查", "幫我", "可以", "需要", "應該", "想要", "知道",
+        "最近一筆", "最新一筆", "最後一筆", "上一筆", "下一筆", "第一筆", "前一筆",
+        "最近一個", "最新一個", "最後一個", "上一個", "下一個", "第一個",
+        "上半年", "下半年", "第一季", "第二季", "第三季", "第四季",
+        "過年", "春節", "新年", "除夕", "元宵", "元宵節", "清明", "清明節",
+        "端午", "端午節", "中秋", "中秋節", "重陽", "重陽節", "農曆新年",
+        "过年", "春节", "元宵节", "清明节", "端午节", "中秋节", "重阳节", "重阳", "农历新年",
+        # generic non-name phrases that frequently appear before 的
+        "任何", "沒有", "有沒", "還有", "什麼", "為何", "為什", "為什麼",
+        "怎麼", "如何", "是否", "其他", "其它", "另外", "另一", "別的",
+        # time-adjacent fragments
+        "期間", "時候", "時間", "之間", "之前", "之後", "以後", "以前",
+        "早上", "中午", "下午", "傍晚", "晚上", "凌晨", "半夜",
+        "每天", "每月", "每年", "每週", "每日", "每位", "每個",
+        "已經", "正在", "一直", "持續", "目前", "現在",
+        # simplified mirrors
+        "没有", "为何", "为什", "为什么", "怎么", "时候", "时间", "时段",
     })
+
+    # Top-200 Taiwan / Chinese family-name allowlist (covers ~95% of cases).
+    # Used to require the FIRST char of a name candidate to be a surname,
+    # rejecting fragments like "天有任何" (from "今天有任何...").
+    # Explicit "list/aggregate" phrases that drop patient-name stickiness.
+    # Used by _is_followup_continuation AND _get_recent_patient_name.
+    _DROP_STICKY_AGGREGATE = (
+        "全部", "所有", "列出", "清單", "列表", "統計", "多少筆", "幾筆",
+        "幾個", "幾位", "幾人", "幾名", "全数", "全數", "總共", "总共", "一共",
+        "共有", "共幾", "總計", "总计", "總數", "总数", "計算", "算一下", "算算",
+        "全體", "全体", "整個", "整个", "整月", "整年", "整週", "整周",
+        "全部報告", "所有手術", "所有病人", "全部病人", "每一筆", "每一位", "每一個",
+        "不限", "不分", "不限定", "通通", "通通有",
+    )
+    _DROP_STICKY_RESET = (
+        "換個", "換成", "改成", "改查", "改用", "重新", "重來", "重查",
+        "不要看", "不看", "別看", "不要查", "別查", "新的", "別的",
+        "別人", "其他人", "另外的", "另一個", "另一位", "其他病人",
+    )
+    _DROP_STICKY_ALL = _DROP_STICKY_AGGREGATE + _DROP_STICKY_RESET
+
+    _SURNAME_CHARS = frozenset(
+        "陳林黃張李王吳劉蔡楊許鄭謝郭洪邱曾廖賴徐周葉蘇莊呂江何蕭羅高潘簡朱鍾彭游詹"
+        "胡施沈余趙盧梁顏柯孫魏翁戴范方宋鄧杜傅侯曹溫薛丁馬蔣唐卓藍馮姚石董紀歐程嚴"
+        "田金童袁雷阮姜白駱崔湯尹龍易常武賀秦顧錢段尤左安牛宮桑岳鍾鐘鐵閻邵錢段尚祝"
+        "于裴卞詹端伍狄習粟連麥史卞聶辜韓畢萬鞠賓滕辛竇皮覃車鞏雍丘伯司"
+        # Two-character surnames (initial char only — sufficient for first-char check)
+        "歐司司司司司"
+    )
 
     def _extract_patient_name_from_query(self, user_query: str) -> Optional[str]:
         """
-        Extract a patient name (純中文 2-4 字) from a query.
-        Conservative: only fires when there's a clear delimiter signal so we don't
-        misclassify generic CJK nouns (手術/報告/病人...) as a name.
-        Patterns:
-          1. CJK 2-4 字 followed by ASCII whitespace (常見輸入: "周建宏 2026年4月...")
-          2. CJK 2-4 字 followed by 的 + (手術|報告|病例|...)
-          3. Query 開頭就是 2-4 字 CJK token，後面接時間標記 (年/月/日/今/昨/上/下/本)
-          4. Elliptical follow-up: "王小美呢" / "王小美的呢" / "王小美嗎" —
-             跨輪對話切換姓名時的省略補問句型
-          5. Query 整句就是 2-4 CJK token（單獨姓名輸入），例如 "王小美"
+        Extract a patient name (純中文 2-4 字, surname-headed) from a query.
+        Conservative: candidate's first character must be in _SURNAME_CHARS,
+        rejecting fragments like "天有任何" or "詢劉美麗".
         """
         import re
 
         q = (user_query or "").strip()
         if not q:
             return None
+
+        # Mask common temporal phrases first so they don't leak into name patterns.
+        masked = q
+        for phrase in (
+            "今天", "昨天", "明天", "前天", "後天", "今日", "昨日",
+            "今年", "去年", "前年", "明年", "本年", "本日",
+            "本月", "上個月", "下個月", "上月", "下月", "這個月", "這月",
+            "本週", "上週", "下週", "這週", "本周", "上周", "下周", "这周",
+            "本星期", "這星期", "上星期", "下星期",
+            "这个月", "这月", "上个月", "下个月", "上半年", "下半年",
+            "上禮拜", "下禮拜",
+        ):
+            masked = masked.replace(phrase, "_" * len(phrase))
 
         cjk = r"[\u4e00-\u9fff\u3400-\u4dbf]{2,4}"
 
@@ -663,30 +714,40 @@ Parameters:
         if m:
             candidates.append(m.group(1))
 
-        # Pattern 2: CJK 2-4 + 的 + 手術/報告/病例/病歷/資料/紀錄/記錄
-        for m in re.finditer(rf"({cjk})的(?:手術|報告|病例|病歷|資料|紀錄|記錄|案件)", q):
+        # Pattern 2: ANY position, CJK 2-4 + 的 + 手術/報告/...; require the
+        # candidate's first char be a surname AND the previous char NOT be CJK
+        # (avoids "詢劉美麗" eating the verb "詢").
+        for m in re.finditer(
+            rf"({cjk})的(?:手術|報告|病例|病歷|資料|紀錄|記錄|案件)",
+            masked,
+        ):
             candidates.append(m.group(1))
 
         # Pattern 3: at start, CJK 2-4 directly followed by a temporal marker
-        m = re.match(rf"^({cjk})(?:今|昨|明|前|後|上|下|本|這|去|今年|2\d{{3}}|\d{{1,2}}月)", q)
+        m = re.match(rf"^({cjk})(?:今|昨|明|前|後|上|下|本|這|去|今年|2\d{{3}}|\d{{1,2}}月|(?:十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)月)", q)
         if m:
             candidates.append(m.group(1))
 
         # Pattern 4: elliptical follow-up particle (跨輪切換姓名)
-        #   e.g. "王小美呢", "王小美的呢", "王小美嗎", "王小美呢?"
         m = re.match(rf"^({cjk})(?:的)?(?:呢|嗎)\s*[?？]?$", q)
         if m:
             candidates.append(m.group(1))
 
         # Pattern 5: query 整句就是 2-4 CJK token (單獨姓名輸入)
-        #   Denylist will reject generic nouns like "手術" / "報告".
-        m = re.fullmatch(cjk, q)
+        m = re.fullmatch(cjk, q.strip())
         if m:
             candidates.append(m.group(0))
 
-        for cand in candidates:
-            if cand and cand not in self._PATIENT_NAME_DENYLIST:
-                return cand
+        # Trim leading non-surname chars: "詢劉美麗" → "劉美麗"
+        for raw in candidates:
+            for i in range(len(raw)):
+                trimmed = raw[i:]
+                if (
+                    2 <= len(trimmed) <= 4
+                    and trimmed[0] in self._SURNAME_CHARS
+                    and trimmed not in self._PATIENT_NAME_DENYLIST
+                ):
+                    return trimmed
         return None
 
     def _is_latest_report_query(self, user_query: str) -> bool:
@@ -722,7 +783,9 @@ Parameters:
             ]
         )
         mentions_latest = explicit_latest or any(k in q_lower for k in ["最近", "最新", "last"])
-        return mentions_latest and mentions_report_domain
+        # Explicit phrases (最近一筆/最新一筆/...) imply the report domain
+        # by themselves; do not require an additional domain word.
+        return explicit_latest or (mentions_latest and mentions_report_domain)
 
     def _to_utc_z(self, dt: datetime) -> str:
         return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -835,6 +898,7 @@ Parameters:
                 "一": 1,
                 "二": 2,
                 "兩": 2,
+                "两": 2,
                 "三": 3,
                 "四": 4,
                 "五": 5,
@@ -849,7 +913,7 @@ Parameters:
             return mapping.get(s)
 
         m_weeks_ago = re.search(r"(\d+)\s*(?:個|个)?\s*(?:週|周|星期)前", q) or re.search(
-            r"(十一|十二|十|一|二|兩|三|四|五|六|七|八|九)\s*(?:個|个)?\s*(?:週|周|星期)前",
+            r"(十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)\s*(?:個|个)?\s*(?:週|周|星期)前",
             q,
         )
         if m_weeks_ago:
@@ -884,6 +948,7 @@ Parameters:
                 "一": 1,
                 "二": 2,
                 "兩": 2,
+                "两": 2,
                 "三": 3,
                 "四": 4,
                 "五": 5,
@@ -904,7 +969,7 @@ Parameters:
             r"(\d+)\s*(?:個|个)?\s*月(?:前|以前)",
             q,
         ) or re.search(
-            r"(十一|十二|十|一|二|兩|三|四|五|六|七|八|九)\s*(?:個|个)?\s*月(?:前|以前)",
+            r"(十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)\s*(?:個|个)?\s*月(?:前|以前)",
             q,
         )
         if m_months_ago:
@@ -917,30 +982,190 @@ Parameters:
                 start_z, end_z = self._local_month_range_utc(y, m)
                 return [(start_z, end_z)]
 
-        if "今年" in q:
-            start_z, end_z = self._local_year_range_utc(now_local.year)
+        # ===== EXTENDED: lunar / solar festivals (春節 / 元宵 / 清明 / 端午 / 中秋 / 重陽 / 除夕) =====
+        try:
+            from zhdate import ZhDate as _ZhDate  # type: ignore
+        except Exception:
+            _ZhDate = None  # type: ignore
+
+        def _festival_year_prefix(default_year: int) -> int:
+            if "去年" in q:
+                return default_year - 1
+            if "前年" in q:
+                return default_year - 2
+            if "明年" in q:
+                return default_year + 1
+            m_y_inline = re.search(r"(?<!\d)(20\d{2})", q)
+            if m_y_inline:
+                return int(m_y_inline.group(1))
+            return default_year
+
+        if _ZhDate is not None:
+            festival_year = _festival_year_prefix(now_local.year)
+
+            def _zh_local_day(year: int, lmonth: int, lday: int):
+                d = _ZhDate(year, lmonth, lday).to_datetime().date()
+                return d
+
+            # Order matters — check more-specific tokens first.
+            if "春節" in q or "春节" in q or "過年" in q or "过年" in q or "農曆新年" in q or "农历新年" in q or "新年" in q:
+                ny = _zh_local_day(festival_year, 1, 1)
+                eve = ny - timedelta(days=1)
+                # Taiwan official holiday: 除夕 → 大年初五（6 天）
+                end_day = ny + timedelta(days=4)
+                start_z, _tmp = self._local_day_range_utc(eve)
+                _tmp, end_z = self._local_day_range_utc(end_day)
+                return [(start_z, end_z)]
+
+            if "除夕" in q:
+                ny = _zh_local_day(festival_year, 1, 1)
+                eve = ny - timedelta(days=1)
+                start_z, end_z = self._local_day_range_utc(eve)
+                return [(start_z, end_z)]
+
+            if "元宵" in q:
+                d = _zh_local_day(festival_year, 1, 15)
+                start_z, end_z = self._local_day_range_utc(d)
+                return [(start_z, end_z)]
+
+            if "端午" in q:
+                d = _zh_local_day(festival_year, 5, 5)
+                start_z, end_z = self._local_day_range_utc(d)
+                return [(start_z, end_z)]
+
+            if "中秋" in q:
+                d = _zh_local_day(festival_year, 8, 15)
+                start_z, end_z = self._local_day_range_utc(d)
+                return [(start_z, end_z)]
+
+            if "重陽" in q or "重阳" in q:
+                d = _zh_local_day(festival_year, 9, 9)
+                start_z, end_z = self._local_day_range_utc(d)
+                return [(start_z, end_z)]
+
+        # 清明 — solar term, falls on 4/4 or 4/5 each year. Use 4/4-4/5 span.
+        if "清明" in q:
+            year = now_local.year
+            if "去年" in q:
+                year -= 1
+            elif "前年" in q:
+                year -= 2
+            elif "明年" in q:
+                year += 1
+            else:
+                m_y_inline = re.search(r"(?<!\d)(20\d{2})", q)
+                if m_y_inline:
+                    year = int(m_y_inline.group(1))
+            from datetime import date as _date_cls
+            start_z, _tmp = self._local_day_range_utc(_date_cls(year, 4, 4))
+            _tmp, end_z = self._local_day_range_utc(_date_cls(year, 4, 5))
             return [(start_z, end_z)]
-        if "去年" in q:
-            year = now_local.year - 1
-            # handle "去年10月"
-            m_last_year_month = re.search(r"去年\s*(\d{1,2})\s*月", q)
-            if m_last_year_month:
-                month = int(m_last_year_month.group(1))
-                if 1 <= month <= 12:
-                    start_z, end_z = self._local_month_range_utc(year, month)
-                    return [(start_z, end_z)]
-            start_z, end_z = self._local_year_range_utc(year)
-            return [(start_z, end_z)]
-        if "前年" in q:
-            year = now_local.year - 2
-            m_prev_year_month = re.search(r"前年\s*(\d{1,2})\s*月", q)
-            if m_prev_year_month:
-                month = int(m_prev_year_month.group(1))
-                if 1 <= month <= 12:
-                    start_z, end_z = self._local_month_range_utc(year, month)
-                    return [(start_z, end_z)]
-            start_z, end_z = self._local_year_range_utc(year)
-            return [(start_z, end_z)]
+
+        # ===== EXTENDED: quarter / half-year / month-range / recent-N-months =====
+        # Helper: pick a year prefix (今年/去年/前年/explicit "20YY")
+        def _pick_year(default_year: int) -> int:
+            if "去年" in q:
+                return default_year - 1
+            if "前年" in q:
+                return default_year - 2
+            m_y_inline = re.search(r"(?<!\d)(20\d{2})", q)
+            if m_y_inline:
+                return int(m_y_inline.group(1))
+            return default_year
+
+        # Quarter: 第一季 / 第1季 / Q1 / q1 (1-4)
+        m_quarter = re.search(r"第\s*([一二三四1-4])\s*季", q) or re.search(
+            r"(?:^|[^A-Za-z])[Qq]\s*([1-4])(?![0-9])", q
+        )
+        if m_quarter:
+            qmap = {"一": 1, "二": 2, "三": 3, "四": 4, "1": 1, "2": 2, "3": 3, "4": 4}
+            qn = qmap.get(m_quarter.group(1))
+            if qn:
+                year = _pick_year(now_local.year)
+                start_month = (qn - 1) * 3 + 1
+                end_month = start_month + 2
+                s, _ = self._local_month_range_utc(year, start_month)
+                _, e = self._local_month_range_utc(year, end_month)
+                return [(s, e)]
+
+        # Half-year: 上半年 / 下半年
+        if "上半年" in q or "下半年" in q:
+            year = _pick_year(now_local.year)
+            if "上半年" in q:
+                s, _ = self._local_month_range_utc(year, 1)
+                _, e = self._local_month_range_utc(year, 6)
+            else:
+                s, _ = self._local_month_range_utc(year, 7)
+                _, e = self._local_month_range_utc(year, 12)
+            return [(s, e)]
+
+        # 最近 N 個月 / 近 N 個月（不含「N個月前」— 那走既有路徑）
+        if not re.search(r"(?:個|个)?\s*月\s*(?:前|以前)", q):
+            m_recent_months = re.search(
+                r"(?:最近|近)\s*(\d+|十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)\s*(?:個|个)?\s*月",
+                q,
+            )
+            if m_recent_months:
+                n_recent = _parse_zh_int(m_recent_months.group(1))
+                if n_recent and n_recent > 0:
+                    end_total = now_local.year * 12 + (now_local.month - 1)
+                    start_total = end_total - (n_recent - 1)
+                    sy = start_total // 12
+                    sm = (start_total % 12) + 1
+                    ey = end_total // 12
+                    em = (end_total % 12) + 1
+                    s, _ = self._local_month_range_utc(sy, sm)
+                    _, e = self._local_month_range_utc(ey, em)
+                    return [(s, e)]
+
+        # Month range: 1月到2月 / 1-3月 / 1~3月 / 1月2月 / 一月二月 / 一月到二月 /
+        #              一月跟二月 / 一月與二月 / 一月及二月 / 一月、二月
+        cjk_num = "(十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)"
+        m_month_range = (
+            re.search(r"(?<!\d)(\d{1,2})\s*月\s*(?:到|至|~|-)\s*(\d{1,2})\s*月", q)
+            or re.search(r"(?<!\d)(\d{1,2})\s*(?:到|至|~|-)\s*(\d{1,2})\s*月", q)
+            or re.search(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*月", q)
+            or re.search(
+                cjk_num + r"\s*月\s*(?:到|至|~|-|跟|與|与|和|及|、)\s*" + cjk_num + r"\s*月",
+                q,
+            )
+            or re.search(cjk_num + r"\s*月\s*" + cjk_num + r"\s*月", q)
+        )
+        if m_month_range:
+            m1 = _parse_zh_int(m_month_range.group(1))
+            m2 = _parse_zh_int(m_month_range.group(2))
+            if m1 and m2 and 1 <= m1 <= 12 and 1 <= m2 <= 12 and m1 <= m2:
+                year = _pick_year(now_local.year)
+                s, _ = self._local_month_range_utc(year, m1)
+                _, e = self._local_month_range_utc(year, m2)
+                return [(s, e)]
+
+        # 今年 / 去年 / 前年 — also accept inline "X月" (Arabic OR CJK numerals).
+        _year_keywords = {"今年": 0, "去年": -1, "前年": -2, "明年": 1}
+        for _yk, _delta in _year_keywords.items():
+            if _yk in q:
+                _year = now_local.year + _delta
+                # Arabic month: 今年10月 / 去年10月
+                _m_arabic = re.search(rf"{_yk}\s*(\d{{1,2}})\s*月", q)
+                if _m_arabic:
+                    _month = int(_m_arabic.group(1))
+                    if 1 <= _month <= 12:
+                        start_z, end_z = self._local_month_range_utc(_year, _month)
+                        return [(start_z, end_z)]
+                # CJK month: 今年一月 / 去年十月 / 前年十一月
+                _m_cjk = re.search(
+                    rf"{_yk}\s*(十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)\s*月",
+                    q,
+                )
+                if _m_cjk:
+                    _month = _parse_zh_int(_m_cjk.group(1))
+                    if _month and 1 <= _month <= 12:
+                        start_z, end_z = self._local_month_range_utc(_year, _month)
+                        return [(start_z, end_z)]
+                # Fall back: whole year
+                start_z, end_z = self._local_year_range_utc(_year)
+                return [(start_z, end_z)]
+
 
         if "本月" in q or "這個月" in q or "这个月" in q:
             start_z, end_z = self._local_month_range_utc(now_local.year, now_local.month)
@@ -974,9 +1199,24 @@ Parameters:
                 start_z, end_z = self._local_month_range_utc(year, month)
                 return [(start_z, end_z)]
 
+        # CJK numerals: 2026年四月 / 2025年十月 / 2024年十一月
+        m_ym_cjk = re.search(
+            r"(?<!\d)(20\d{2})\s*年\s*(十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)\s*月",
+            q,
+        )
+        if m_ym_cjk:
+            year = int(m_ym_cjk.group(1))
+            month = _parse_zh_int(m_ym_cjk.group(2))
+            if month and 1 <= month <= 12:
+                start_z, end_z = self._local_month_range_utc(year, month)
+                return [(start_z, end_z)]
+
         # year only: 2024年 / 2024 年 / 2024年度
-        # Must NOT match if followed by "M月" — that case is handled above.
-        m_year = re.search(r"(?<!\d)(20\d{2})\s*年(?:度)?(?!\s*\d{1,2}\s*月)", q)
+        # Must NOT match if followed by an Arabic OR CJK month suffix.
+        m_year = re.search(
+            r"(?<!\d)(20\d{2})\s*年(?:度)?(?!\s*(?:\d{1,2}|十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)\s*月)",
+            q,
+        )
         if m_year:
             year = int(m_year.group(1))
             start_z, end_z = self._local_year_range_utc(year)
@@ -990,7 +1230,55 @@ Parameters:
                 start_z, end_z = self._local_month_range_utc(now_local.year, month)
                 return [(start_z, end_z)]
 
+        # CJK month only: "二月" / "十月" / "十一月" => default current year
+        m_m_cjk = re.search(
+            r"(?<!\d)(十一|十二|十|一|二|兩|两|三|四|五|六|七|八|九)\s*月",
+            q,
+        )
+        if m_m_cjk:
+            month = _parse_zh_int(m_m_cjk.group(1))
+            if month and 1 <= month <= 12:
+                start_z, end_z = self._local_month_range_utc(now_local.year, month)
+                return [(start_z, end_z)]
+
         return []
+
+    def _get_recent_patient_name(self, session: str) -> Optional[str]:
+        """Walk back through user messages, return the most-recent extractable
+        patient name. Stops at explicit drop signals (全部/所有/列出/...) so a
+        prior topic switch does not bleed back through."""
+        history = self.conversation_history.get(session, [])
+        for msg in reversed(history):
+            if getattr(msg, "role", None) != "user":
+                continue
+            content = getattr(msg, "content", "") or ""
+            if any(k in content for k in self._DROP_STICKY_ALL):
+                return None
+            name = self._extract_patient_name_from_query(content)
+            if name:
+                return name
+        return None
+
+    def _is_followup_continuation(self, user_query: str) -> bool:
+        """Detect Chinese follow-up particles signalling continuation of the
+        previous turn (那 / 那麼 / 呢 / 嗎 in short queries). Returns False on
+        explicit list/aggregate/reset signals so user can break sticky."""
+        q = (user_query or "").strip()
+        if not q:
+            return False
+        # Explicit list/aggregate/reset signals drop sticky and end follow-up.
+        for stop in self._DROP_STICKY_ALL:
+            if stop in q:
+                return False
+        if q.startswith("那") or q.startswith("那麼"):
+            return True
+        no_punct = q.rstrip("?？.。!！")
+        if no_punct.endswith("呢"):
+            return True
+        # Short time-only follow-up: "二月" / "上週" alone after a name turn.
+        if len(q) <= 8:
+            return True
+        return False
 
     def _apply_time_parsing_and_normalization(
         self,
@@ -1644,7 +1932,11 @@ Tools: {tool_summary}
     ) -> ToolCallResult:
         # Rewrite relative temporal expressions so LLM tool-calling uses exact dates.
         # Range version: "上週" → "2026-04-06 到 2026-04-12" (for time-range tools).
-        user_query = normalize_temporal_range(user_query, datetime.now())
+        # Skip normalize_temporal_range when our extended parser already
+        # extracts ranges from the raw query — otherwise the normalizer
+        # may rewrite '今年一月' to an ISO range and orphan '二月'.
+        if not self._parse_time_ranges_from_query(user_query):
+            user_query = normalize_temporal_range(user_query, datetime.now())
         if not self.client_list:
             # Gateway may start before MCP server is ready.
             # Try reconnecting on-demand so users don't need to restart the gateway manually.
@@ -1701,6 +1993,36 @@ Tools: {tool_summary}
             parameters=decision.parameters,
         )
 
+        # Patient-name continuity: when current query has no patient name and
+        # is a clear follow-up (那/呢/short), inherit the most-recent patient
+        # name from this session and switch to findByPatientName.
+        try:
+            current_name = self._extract_patient_name_from_query(user_query)
+            if (
+                tool_name in {
+                    "surgicalReport.findByOperationStartTimeRange",
+                    "surgicalReport.findByOperationStartTimeRanges",
+                    "surgicalReport.findLatestByCreatedAt",
+                }
+                and not (parameters or {}).get("name")
+                and not (parameters or {}).get("caseCode")
+                and current_name is None
+                and self._is_followup_continuation(user_query)
+            ):
+                recent_name = self._get_recent_patient_name(session)
+                if recent_name and self._find_client_for_tool(
+                    decision.server_name, "surgicalReport.findByPatientName"
+                ) is not None:
+                    new_params: Dict[str, Any] = {"name": recent_name}
+                    if (parameters or {}).get("start"):
+                        new_params["start"] = parameters["start"]
+                    if (parameters or {}).get("end"):
+                        new_params["end"] = parameters["end"]
+                    tool_name = "surgicalReport.findByPatientName"
+                    parameters = new_params
+        except Exception:
+            pass
+
         return await self._execute_tool(
             decision.server_name,
             tool_name,
@@ -1719,7 +2041,11 @@ Tools: {tool_summary}
         Like process_query_only_tool_result(), but also asks the LLM to generate a
         human-readable final answer based on the tool result.
         """
-        user_query = normalize_temporal_range(user_query, datetime.now())
+        # Skip normalize_temporal_range when our extended parser already
+        # extracts ranges from the raw query — otherwise the normalizer
+        # may rewrite '今年一月' to an ISO range and orphan '二月'.
+        if not self._parse_time_ranges_from_query(user_query):
+            user_query = normalize_temporal_range(user_query, datetime.now())
         tool_call = await self.process_query_only_tool_result(
             user_query,
             session=session,

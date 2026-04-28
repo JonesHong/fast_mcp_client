@@ -534,7 +534,16 @@ async def _llm_classify_intent(
         "幾張",
     ]
     is_short_followup = (len(q) <= 14) and (("呢" in q) or q.endswith("?") or q.endswith("？"))
-    heuristic_medical_ellipsis = bool(time_hint and (any(w in q_lower for w in retrieval_words) or is_short_followup))
+    # Naked time-only queries ("Q1", "上半年", "最近三個月", "過年") are also
+    # almost always medical-report intent in this domain.
+    heuristic_medical_ellipsis = bool(
+        time_hint
+        and (
+            any(w in q_lower for w in retrieval_words)
+            or is_short_followup
+            or len(q) <= 12
+        )
+    )
 
     # Patient name heuristic: borrow agent._extract_patient_name_from_query
     # (which already has denylist) to catch "王小美" / "王小美呢" / "王小美的手術"
@@ -549,10 +558,20 @@ async def _llm_classify_intent(
     except Exception:
         heuristic_medical_patient = False
 
+    # Explicit latest-report queries ("最近一筆" / "最新一筆" / "latest" ...).
+    # The agent helper already enforces denylist + domain check.
+    heuristic_medical_latest = False
+    try:
+        latest_fn = getattr(agent, "_is_latest_report_query", None)
+        if callable(latest_fn) and latest_fn(message):
+            heuristic_medical_latest = True
+    except Exception:
+        heuristic_medical_latest = False
+
     # Prefer deterministic intent decisions to avoid hangs when Ollama is idle/busy.
     if heuristic_intro:
         return "intro"
-    if heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient:
+    if heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient or heuristic_medical_latest:
         return "medical"
 
     system = (
@@ -582,14 +601,14 @@ async def _llm_classify_intent(
         intent = str(obj.get("intent", "")).strip().lower()
         if intent in {"medical", "intro", "other"}:
             # Hard guardrails: intro always wins; and time/id/caseCode/patient-name queries should not be classified as "other".
-            if intent == "other" and (heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient):
+            if intent == "other" and (heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient or heuristic_medical_latest):
                 return "medical"
             return intent
     except Exception:
         pass
 
     # Conservative fallback (non-blocking)
-    if heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient:
+    if heuristic_medical or heuristic_medical_ellipsis or heuristic_medical_patient or heuristic_medical_latest:
         return "medical"
     return "other"
 

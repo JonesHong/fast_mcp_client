@@ -24,3 +24,7 @@ env/
 # Logs
 *.log
 
+
+# Local backup snapshots
+*.bak.*
+*.bak
